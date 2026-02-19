@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Data Exploration Script for KEYNG Dataset
+Data Exploration Script for the Dataset
 ==========================================
 
 This script explores IMU data from smart ring wearables and keystroke timestamps.
@@ -526,7 +526,7 @@ def create_combined_imu_keystroke_plot(csv_files_session, pkl_file, subject, ses
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Explore KEYNG dataset')
+    parser = argparse.ArgumentParser(description='Explore dataset')
     parser.add_argument('--visualize', action='store_true', 
                        help='Generate visualizations')
     parser.add_argument('--save-plots', action='store_true',
@@ -546,7 +546,7 @@ def main():
     pkl_files = sorted(data_dir.glob('*.pkl'))
     
     print(f"\n{'='*60}")
-    print(f"KEYNG Dataset Exploration")
+    print(f"Dataset Exploration")
     print(f"{'='*60}")
     print(f"\n📁 Data Directory: {data_dir}")
     print(f"  Found {len(csv_files)} CSV files (IMU data)")
