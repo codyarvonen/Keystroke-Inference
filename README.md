@@ -17,3 +17,6 @@ tests that the gpu set up has enough VRAM to handle a forward and backward pass 
 
 ```gpu_test.py``` 
 checks GPU availability
+
+```validate_data_loader.py```
+builds the PyTorch `Dataset`/`DataLoader` pipeline, reports runtime and dataset statistics, and provides a small usage/demo of the data loader
