@@ -1,6 +1,6 @@
 # Ring-to-Text: Keystroke Inference from Wearable IMU Rings
 
-Infers typed text from IMU sensor data recorded by smart rings worn on both hands. A frozen Chronos time-series encoder and a frozen Qwen2.5-1.5B language model are bridged by a small trainable Perceiver resampler adapter.
+Infers typed text from IMU sensor data recorded by smart rings worn on both hands. A frozen Chronos time-series encoder and a frozen GPT-2 language model are bridged by a small trainable Perceiver resampler adapter.
 
 ## Architecture
 
