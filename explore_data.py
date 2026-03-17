@@ -21,6 +21,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
 
+from utils.constants import IMU_COLS, IMU_EPS
+from utils.filename import parse_filename as _parse_filename_shared
+from utils.imu_io import get_time_column as _get_time_column
+
 # Set style for better visualizations
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (12, 6)
@@ -33,20 +37,17 @@ def load_pkl_file(pkl_path):
 
 
 def parse_filename(filename):
-    """Parse filename to extract subject, session, and ring side."""
-    # Format: 003_005_DIBS-L_corrected.csv or 003_005_Macbook.pkl
-    parts = filename.replace('_corrected', '').replace('.csv', '').replace('.pkl', '').split('_')
-    if len(parts) >= 3:
-        subject = parts[0]
-        session = parts[1]
-        device = '_'.join(parts[2:])
-        ring_side = None
-        if 'DIBS-L' in device:
-            ring_side = 'L'
-        elif 'DIBS-R' in device:
-            ring_side = 'R'
-        return subject, session, ring_side, device
-    return None, None, None, None
+    """Parse filename to extract subject, session, ring side, and device string."""
+    subject, session, ring_side = _parse_filename_shared(filename)
+    if subject is None:
+        return None, None, None, None
+    stem = (str(Path(filename).name)
+            .replace('_corrected', '')
+            .replace('.csv', '')
+            .replace('.pkl', ''))
+    parts = stem.split('_')
+    device = '_'.join(parts[2:]) if len(parts) >= 3 else ''
+    return subject, session, ring_side, device
 
 
 def analyze_imu_data(csv_path, visualize=False):
@@ -65,13 +66,11 @@ def analyze_imu_data(csv_path, visualize=False):
     print(f"  Memory usage: {df.memory_usage(deep=True).sum() / 1024**2:.2f} MB")
     
     # Time range
-    if 'Effective Timestamp' in df.columns:
-        time_col = 'Effective Timestamp'
-    elif 'Time Stamp' in df.columns:
-        time_col = 'Time Stamp'
-    else:
+    try:
+        time_col = _get_time_column(df)
+    except ValueError:
         time_col = None
-    
+
     if time_col:
         time_min = df[time_col].min()
         time_max = df[time_col].max()
@@ -88,8 +87,7 @@ def analyze_imu_data(csv_path, visualize=False):
             print(f"  Average sampling rate: {avg_sample_rate:.2f} Hz")
     
     # IMU statistics
-    imu_cols = ['Accel-x', 'Accel-y', 'Accel-z', 'Gyro-x', 'Gyro-y', 'Gyro-z']
-    available_imu_cols = [col for col in imu_cols if col in df.columns]
+    available_imu_cols = [col for col in IMU_COLS if col in df.columns]
     
     if available_imu_cols:
         print(f"\n📈 IMU Sensor Statistics:")
@@ -339,11 +337,9 @@ def analyze_data_alignment(csv_path, pkl_path, visualize=False):
     keystroke_data = load_pkl_file(pkl_path)
     
     # Get time ranges
-    if 'Effective Timestamp' in df.columns:
-        imu_time_col = 'Effective Timestamp'
-    elif 'Time Stamp' in df.columns:
-        imu_time_col = 'Time Stamp'
-    else:
+    try:
+        imu_time_col = _get_time_column(df)
+    except ValueError:
         print("⚠️  Cannot find timestamp column in IMU data")
         return None
     
@@ -433,11 +429,9 @@ def create_combined_imu_keystroke_plot(csv_files_session, pkl_file, subject, ses
     earliest_imu_time = None
     for csv_file in csv_files_session:
         df = pd.read_csv(csv_file)
-        if 'Effective Timestamp' in df.columns:
-            time_col = 'Effective Timestamp'
-        elif 'Time Stamp' in df.columns:
-            time_col = 'Time Stamp'
-        else:
+        try:
+            time_col = _get_time_column(df)
+        except ValueError:
             continue
         file_start = df[time_col].min()
         if earliest_imu_time is None or file_start < earliest_imu_time:
@@ -452,12 +446,9 @@ def create_combined_imu_keystroke_plot(csv_files_session, pkl_file, subject, ses
         # Load IMU data
         df = pd.read_csv(csv_file)
         _, _, ring_side, _ = parse_filename(csv_file.name)
-        
-        if 'Effective Timestamp' in df.columns:
-            time_col = 'Effective Timestamp'
-        elif 'Time Stamp' in df.columns:
-            time_col = 'Time Stamp'
-        else:
+        try:
+            time_col = _get_time_column(df)
+        except ValueError:
             continue
         
         # Get full IMU time range (before sampling)
@@ -467,8 +458,7 @@ def create_combined_imu_keystroke_plot(csv_files_session, pkl_file, subject, ses
         imu_end_norm = imu_end_full - earliest_imu_time
         
         # Drop rows with NaN values in IMU columns before sampling
-        imu_cols = ['Accel-x', 'Accel-y', 'Accel-z', 'Gyro-x', 'Gyro-y', 'Gyro-z']
-        df_clean = df.dropna(subset=imu_cols)
+        df_clean = df.dropna(subset=IMU_COLS)
         
         # Sample data for faster plotting
         sample_size = min(50000, len(df_clean))
@@ -484,7 +474,7 @@ def create_combined_imu_keystroke_plot(csv_files_session, pkl_file, subject, ses
         # Plot IMU data (all 6 channels)
         colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
         
-        for col_idx, col in enumerate(imu_cols):
+        for col_idx, col in enumerate(IMU_COLS):
             if col in sample_df.columns:
                 # Get values (should already be clean of NaNs, but double-check)
                 values = sample_df[col].values
@@ -493,7 +483,7 @@ def create_combined_imu_keystroke_plot(csv_files_session, pkl_file, subject, ses
                     values_clean = values[~np.isnan(values)]
                     times_clean = imu_times_norm[~np.isnan(values)]
                     if len(values_clean) > 0:
-                        values_norm = (values_clean - values_clean.mean()) / (values_clean.std() + 1e-8)
+                        values_norm = (values_clean - values_clean.mean()) / (values_clean.std() + IMU_EPS)
                         ax.plot(times_clean, values_norm + col_idx * 3, 
                                label=col, color=colors[col_idx], alpha=0.7, linewidth=0.5)
         
@@ -624,11 +614,9 @@ def main():
     total_duration_seconds = 0
     for csv_file in csv_files:
         df = pd.read_csv(csv_file)
-        if 'Effective Timestamp' in df.columns:
-            time_col = 'Effective Timestamp'
-        elif 'Time Stamp' in df.columns:
-            time_col = 'Time Stamp'
-        else:
+        try:
+            time_col = _get_time_column(df)
+        except ValueError:
             continue
         duration = df[time_col].max() - df[time_col].min()
         total_duration_seconds += duration

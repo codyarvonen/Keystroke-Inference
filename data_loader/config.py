@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional, Sequence, Tuple
 
+from utils.filename import parse_filename as _parse_filename
+
 
 SplitStrategy = Literal["LOSO", "LOPO", "random"]
 TargetVariant = Literal["raw_keystrokes", "clean_text", "clean_tokens"]
@@ -52,12 +54,9 @@ def parse_subject_session(filename: str) -> Tuple[str, str]:
     Returns:
       (subject, session) as strings.
     """
-    stem = Path(filename).stem
-    parts = stem.split("_")
-    if len(parts) < 2:
+    subject, session, _ = _parse_filename(filename)
+    if subject is None:
         raise ValueError(f"Cannot parse subject/session from filename: {filename}")
-    subject = parts[0]
-    session = parts[1]
     return subject, session
 
 

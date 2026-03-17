@@ -1,22 +1,108 @@
-## CROSS-MODAL FOUNDATION MODEL FUSION FOR KEYSTROKE INFERENCE ON WEARABLE RINGS
+# Ring-to-Text: Keystroke Inference from Wearable IMU Rings
 
-This is a description of the scripts that I have so far. I will be making a proper data loader soon. In the mean time, you can use and modify these scripts to explore the dataset. 
+Infers typed text from IMU sensor data recorded by smart rings worn on both hands. A frozen Chronos time-series encoder and a frozen Qwen2.5-1.5B language model are bridged by a small trainable Perceiver resampler adapter.
 
-FYI, these scripts were primarily AI generated as a way for me to quickly explore the data. I am unaware of any bugs since I have not looked too carefully at the code.
+## Architecture
 
-## Scripts
+```
+IMU (CSV) ──► Chronos (frozen) ──► IMUAdapter (trainable) ──► LLM/gpt2 (frozen) ──► text
+             per-channel encode      perceiver resampler
+             d_chronos = 768×12      32 soft tokens
+```
 
-```explore_data.py``` 
-calculates general statistics about the dataset, like how much typing data is in each session, how many keystrokes were recorded, keystroke distributions, etc.
+- **Chronos** encodes each IMU axis independently; embeddings are concatenated → `d_chronos = 768 × n_channels` (9216 for both rings, 4608 for one)
+- **IMUAdapter** (~4M params, only trainable component) compresses variable-length Chronos output into 32 fixed soft tokens via a Perceiver resampler
+- **LLM** (base, frozen) generates text conditioned on the soft tokens prepended with the prompt *"The user typed: "*; default is `gpt2`, alternatives include `gpt2-medium`, `gpt2-large`, `Qwen/Qwen2.5-1.5B`
 
-```regenerate_text.py``` 
-generates coherent text from the noisy keystroke sequences
+## Setup
 
-```stress_test.py``` 
-tests that the gpu set up has enough VRAM to handle a forward and backward pass of GPT2
+```bash
+conda env create -f environment.yml
+conda activate ring2text
+```
 
-```gpu_test.py``` 
-checks GPU availability
+## Data format (`data/`)
 
-```validate_data_loader.py```
-builds the PyTorch `Dataset`/`DataLoader` pipeline, reports runtime and dataset statistics, and provides a small usage/demo of the data loader
+```
+{subject}_{session}_DIBS-L_corrected.csv   # Left ring IMU (Accel x/y/z, Gyro x/y/z)
+{subject}_{session}_DIBS-R_corrected.csv   # Right ring IMU
+{subject}_{session}_Macbook.pkl            # Keystroke timestamps: key_times dict
+```
+
+## Pipeline
+
+### 1. Preprocess: raw data → Chronos embeddings
+
+```bash
+python preprocess.py \
+    --raw_dir ./data \
+    --output_dir ./embeddings \
+    --ring both \
+    --window_size 10.0 \
+    --step_size 5.0
+```
+
+Produces `embeddings/train.pt`, `val.pt`, `test.pt`.
+
+Key options: `--ring {L,R,both}`, `--window_size`, `--step_size`, `--min_text_len`, `--target_hz`, `--no_normalize`
+
+### 2. Train: fit the adapter
+
+```bash
+python train.py --data_file ./embeddings/train.pt --val_data_file ./embeddings/val.pt
+```
+
+Saves `checkpoints/adapter_best.pt` and `checkpoints/adapter_final.pt`.
+
+### 3. Inference: generate text
+
+```bash
+# From pre-computed embeddings
+python generate.py \
+    --adapter_path ./checkpoints/adapter_final.pt \
+    --input_file ./embeddings/test.pt
+
+# Directly from raw data (runs Chronos on-the-fly)
+python generate.py \
+    --adapter_path ./checkpoints/adapter_final.pt \
+    --raw_dir ./data
+
+# Integration test with random embeddings
+python generate.py \
+    --adapter_path ./checkpoints/adapter_final.pt \
+    --demo
+```
+
+## Utility scripts
+
+| Script | Purpose |
+|---|---|
+| `explore_data.py` | IMU/keystroke statistics and optional visualizations (`--visualize`, `--save-plots`) |
+| `regenerate_text.py` | Reconstruct text from keystroke PKL files (`--data-dir`, `--session`) |
+| `validate_data_loader.py` | Test the `data_loader/` PyTorch pipeline and report dataset statistics |
+| `gpu_test.py` | Check CUDA availability |
+| `stress_test.py` | GPU memory stress test (forward + backward pass) |
+
+## Repository layout
+
+```
+├── preprocess.py          # IMU → Chronos embeddings (offline)
+├── train.py               # Adapter training loop
+├── generate.py            # Inference / text generation
+├── model.py               # RingToText: full forward + generation
+├── adapter.py             # IMUAdapter: perceiver resampler
+├── dataset.py             # IMUTextDataset for training
+├── data_loader/           # PyTorch DataLoader pipeline (no pre-computed embeddings)
+│   ├── config.py
+│   ├── dataset.py
+│   ├── sessions.py
+│   ├── splits.py
+│   ├── windows.py
+│   └── labels.py
+└── utils/                 # Shared utilities
+    ├── constants.py       # IMU_COLS, CHRONOS_DEFAULT_MODEL, IMU_EPS
+    ├── filename.py        # parse_filename()
+    ├── imu_io.py          # get_time_column(), load_imu_csv()
+    ├── keystroke.py       # keystroke parsing + text reconstruction
+    └── chronos_encode.py  # encode_with_chronos()
+```
