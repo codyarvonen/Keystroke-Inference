@@ -1,18 +1,18 @@
 # Ring-to-Text: Keystroke Inference from Wearable IMU Rings
 
-Infers typed text from IMU sensor data recorded by smart rings worn on both hands. A frozen Chronos time-series encoder and a frozen GPT-2 language model are bridged by a small trainable Perceiver resampler adapter.
+Infers typed text from IMU sensor data recorded by smart rings worn on both hands. A frozen Chronos time-series encoder and a frozen Qwen2.5-1.5B language model are bridged by a small trainable Perceiver resampler adapter.
 
 ## Architecture
 
 ```
-IMU (CSV) ──► Chronos (frozen) ──► IMUAdapter (trainable) ──► LLM/gpt2 (frozen) ──► text
+IMU (CSV) ──► Chronos (frozen) ──► IMUAdapter (trainable) ──► LLM/Qwen2.5-1.5B (frozen) ──► text
              per-channel encode      perceiver resampler
              d_chronos = 768×12      32 soft tokens
 ```
 
-- **Chronos** encodes each IMU axis independently; embeddings are concatenated → `d_chronos = 768 × n_channels` (9216 for both rings, 4608 for one)
-- **IMUAdapter** (~4M params, only trainable component) compresses variable-length Chronos output into 32 fixed soft tokens via a Perceiver resampler
-- **LLM** (base, frozen) generates text conditioned on the soft tokens prepended with the prompt *"The user typed: "*; default is `gpt2`, alternatives include `gpt2-medium`, `gpt2-large`, `Qwen/Qwen2.5-1.5B`
+- **Chronos** encodes each IMU axis independently; embeddings are concatenated → `d_chronos = 768 × n_channels` (9216 for both rings, 4608 for one). Embeddings are mean-centred (train-set mean subtracted) to remove the shared background direction.
+- **IMUAdapter** (~4M params, only trainable component) compresses variable-length Chronos output into 32 fixed soft tokens via a Perceiver resampler (no LayerNorm on InputProjection)
+- **LLM** (`Qwen/Qwen2.5-1.5B`, base, frozen) generates text conditioned on the soft tokens prepended with the prompt *"The user typed: "*
 
 ## Setup
 
@@ -42,9 +42,9 @@ python preprocess.py \
     --step_size 5.0
 ```
 
-Produces `embeddings/train.pt`, `val.pt`, `test.pt`.
+Produces `embeddings/train.pt`, `val.pt`, `test.pt` (session-level splits). Applies per-channel z-score normalisation on raw IMU, then mean-centres Chronos embeddings using the training-set mean.
 
-Key options: `--ring {L,R,both}`, `--window_size`, `--step_size`, `--min_text_len`, `--target_hz`, `--no_normalize`
+Key options: `--ring {L,R,both}`, `--window_size`, `--step_size`, `--min_text_len`, `--target_hz`, `--no_normalize`, `--val_split`, `--test_split`
 
 ### 2. Train: fit the adapter
 
@@ -53,6 +53,15 @@ python train.py --data_file ./embeddings/train.pt --val_data_file ./embeddings/v
 ```
 
 Saves `checkpoints/adapter_best.pt` and `checkpoints/adapter_final.pt`.
+
+Key defaults: `--llm Qwen/Qwen2.5-1.5B`, `--epochs 200`, `--lr 3e-5`, `--adapter_dropout 0.1`, `--max_grad_norm 0.5`, `--warmup_steps 200`, `--div_weight 10.0`, `--recon_weight 100.0`, `--contrast_weight 0.3`
+
+Anti-collapse losses (all weighted and summed with LM cross-entropy):
+- `--div_weight` — penalises high cosine similarity between soft tokens across the batch (diversity loss)
+- `--recon_weight` — forces resampler output mean to reconstruct projected input mean (content anchoring)
+- `--contrast_weight` / `--contrast_temp` — InfoNCE between soft token prototypes and LLM text embedding prototypes (semantic grounding)
+
+Optional LoRA fine-tuning of the LLM: `--lora_rank N` (default 0 = frozen).
 
 ### 3. Inference: generate text
 

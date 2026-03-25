@@ -170,7 +170,7 @@ class RingToText(nn.Module):
         Returns:
             dict with 'loss' and 'logits'
         """
-        soft_tokens = self.adapter(chronos_embeds, chronos_mask)
+        soft_tokens, resampler_out, projected_mean = self.adapter(chronos_embeds, chronos_mask)
         combined, n_prefix = self._build_inputs(soft_tokens, target_ids)
 
         # NOTE: do NOT wrap in torch.no_grad() here — gradients must flow
@@ -189,7 +189,13 @@ class RingToText(nn.Module):
             ignore_index=-100,
         )
 
-        return {"loss": loss, "logits": text_logits}
+        return {
+            "loss": loss,
+            "logits": text_logits,
+            "soft_tokens": soft_tokens,
+            "resampler_out": resampler_out,
+            "projected_mean": projected_mean,
+        }
 
     # --------------------------------------------------------------------- #
     #  Generation (inference)
@@ -210,7 +216,7 @@ class RingToText(nn.Module):
 
         Returns a list of decoded strings (one per batch element).
         """
-        soft_tokens = self.adapter(chronos_embeds, chronos_mask)
+        soft_tokens, _, _ = self.adapter(chronos_embeds, chronos_mask)
         combined, _ = self._build_inputs(soft_tokens)
 
         # Prepare stop token

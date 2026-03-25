@@ -18,6 +18,7 @@ import datetime
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from model import RingToText
@@ -79,17 +80,48 @@ def get_args() -> argparse.Namespace:
                    help="Internal hidden dim of the perceiver adapter. "
                         "Must be divisible by 8 (n_heads). "
                         "Smaller = fewer params = less overfitting (default: 256)")
-    p.add_argument("--adapter_dropout", type=float, default=0.5)
+    p.add_argument("--adapter_dropout", type=float, default=0.1,
+                   help="Dropout in adapter layers (default: 0.1; was 0.5 but that killed discriminative gradients)")
 
     # Training
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=3e-5,
+                   help="Learning rate (default: 3e-5; was 1e-4 but caused exploding grad norms)")
     p.add_argument("--weight_decay", type=float, default=0.1)
     p.add_argument("--warmup_steps", type=int, default=200)
     p.add_argument("--grad_accum", type=int, default=1)
     p.add_argument("--max_text_len", type=int, default=64)
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--max_grad_norm", type=float, default=0.5,
+                   help="Gradient clipping norm (default: 0.5; was 1.0 but norms reached 17-18)")
+    p.add_argument("--div_weight", type=float, default=10.0,
+                   help="Weight for soft-token diversity loss. Penalises high cosine similarity "
+                        "between soft tokens of different samples in the same batch, preventing "
+                        "adapter collapse to a constant output (0 = disabled). "
+                        "Needs to be large (~10) for Qwen2.5-1.5B whose LM gradient overwhelms "
+                        "smaller weights; was 0.1 initially (ineffective), then 1.0 (effective "
+                        "for GPT-2 but not Qwen).")
+    p.add_argument("--recon_weight", type=float, default=100.0,
+                   help="Weight for auxiliary reconstruction loss. Trains the adapter to make "
+                        "the mean of its resampler output (adapter_dim) reconstruct the mean of "
+                        "its projected input (adapter_dim). Provides an input-conditional "
+                        "gradient even when LM loss is saturated. Zero extra params. "
+                        "History: 1.0 had zero effect (recon stuck at 0.0078, orthogonal case "
+                        "for 256-d unit vectors, gradient ~700x smaller than LM). 500.0 was "
+                        "effective (recon 0.0078->0.0015, ~36deg alignment) but combined with "
+                        "ct=2.0 drove grad norms to 60-144 and hurt val loss. 100.0 targets "
+                        "~0.15 nat contribution (100 * 0.0015), ~2.7% of LM gradient.")
+    p.add_argument("--contrast_weight", type=float, default=0.3,
+                   help="Weight for contrastive (InfoNCE) loss. Pulls soft-token means toward "
+                        "the LLM text-embedding mean of their own target text and pushes away "
+                        "from other texts in the batch. Teaches the adapter to distinguish "
+                        "inputs by content. Zero extra params. "
+                        "History: 0.1 barely moved ct from random baseline (2.74 vs log(16)=2.77). "
+                        "2.0 dominated training (2.0 * 2.6 = 5.2 nats, ~95% of LM gradient), "
+                        "drove grad norms to 60-144, worst val loss yet. 0.3 targets ~0.78 nat "
+                        "contribution (0.3 * 2.6), ~14% of LM gradient.")
+    p.add_argument("--contrast_temp", type=float, default=0.1,
+                   help="Temperature for InfoNCE contrastive loss (default: 0.1).")
 
     # Logging / saving
     p.add_argument("--save_dir", type=str, default="./checkpoints")
@@ -342,6 +374,9 @@ def train(args: argparse.Namespace):
             break
 
         epoch_loss = 0.0
+        epoch_div_loss = 0.0
+        epoch_recon_loss = 0.0
+        epoch_contrast_loss = 0.0
         epoch_grad_norm = 0.0
         n_epoch_steps = 0
         t0 = time.time()
@@ -360,7 +395,50 @@ def train(args: argparse.Namespace):
             # Forward
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 out = model(chronos_embeds, target_ids, chronos_mask, labels)
-                loss = out["loss"] / args.grad_accum
+                loss = out["loss"]
+
+                # Diversity loss: penalise high cosine similarity between soft
+                # tokens of different samples in the batch, preventing the adapter
+                # from collapsing to a constant output regardless of input.
+                B = chronos_embeds.size(0)
+
+                if args.div_weight > 0:
+                    soft = out["soft_tokens"]                        # (B, n_soft, d_llm)
+                    soft_flat = soft.reshape(B, -1)                  # (B, n_soft * d_llm)
+                    soft_norm = F.normalize(soft_flat.float(), dim=1)
+                    sim = soft_norm @ soft_norm.T                    # (B, B)
+                    off_diag = sim[~torch.eye(B, dtype=torch.bool, device=sim.device)]
+                    div_loss = off_diag.mean()
+                    loss = loss + args.div_weight * div_loss
+
+                # Reconstruction loss: soft token mean (adapter_dim) should
+                # reconstruct the mean of the projected input (adapter_dim).
+                # Provides an input-conditional gradient signal at zero extra params.
+                if args.recon_weight > 0:
+                    pred = out["resampler_out"].mean(dim=1).float()  # (B, adapter_dim)
+                    tgt = out["projected_mean"].float().detach()     # (B, adapter_dim)
+                    pred_n = F.normalize(pred, dim=-1)
+                    tgt_n = F.normalize(tgt, dim=-1)
+                    recon_loss = F.mse_loss(pred_n, tgt_n)
+                    loss = loss + args.recon_weight * recon_loss
+
+                # Contrastive loss (InfoNCE): soft-token mean (d_llm) should be
+                # closer to its own text's LLM embedding mean than to others.
+                # Teaches the adapter to distinguish inputs by textual content.
+                if args.contrast_weight > 0:
+                    with torch.no_grad():
+                        text_emb = model._embed_layer(target_ids).float()   # (B, S, d_llm)
+                        pad_mask = (labels != -100).unsqueeze(-1).float()   # (B, S, 1)
+                        text_proto = (text_emb * pad_mask).sum(1) / pad_mask.sum(1).clamp(min=1)
+                    soft_proto = out["soft_tokens"].mean(dim=1).float()     # (B, d_llm)
+                    s_norm = F.normalize(soft_proto, dim=-1)
+                    t_norm = F.normalize(text_proto, dim=-1)
+                    sim_ct = s_norm @ t_norm.T / args.contrast_temp         # (B, B)
+                    ct_labels = torch.arange(B, device=device)
+                    contrast_loss = F.cross_entropy(sim_ct, ct_labels)
+                    loss = loss + args.contrast_weight * contrast_loss
+
+                loss = loss / args.grad_accum
 
             loss.backward()
 
@@ -375,14 +453,27 @@ def train(args: argparse.Namespace):
                 n_epoch_steps += 1
 
             epoch_loss += out["loss"].item()
+            if args.div_weight > 0:
+                epoch_div_loss += div_loss.item()
+            if args.recon_weight > 0:
+                epoch_recon_loss += recon_loss.item()
+            if args.contrast_weight > 0:
+                epoch_contrast_loss += contrast_loss.item()
 
             # Step log
             if global_step % args.log_every == 0 and global_step > 0:
-                avg_loss = epoch_loss / (batch_idx + 1)
+                n_batches = batch_idx + 1
+                avg_loss = epoch_loss / n_batches
                 avg_gnorm = epoch_grad_norm / max(n_epoch_steps, 1)
                 elapsed = time.time() - t0
                 wall = time.time() - train_start
                 mem = gpu_mem_str()
+                div_str = (f" | div {epoch_div_loss / n_batches:.4f}"
+                           if args.div_weight > 0 else "")
+                recon_str = (f" | recon {epoch_recon_loss / n_batches:.4f}"
+                             if args.recon_weight > 0 else "")
+                contrast_str = (f" | ct {epoch_contrast_loss / n_batches:.4f}"
+                                if args.contrast_weight > 0 else "")
                 logger.info(
                     f"[ep {epoch+1:02d}/{args.epochs}] "
                     f"step {global_step:5d} | "
@@ -391,6 +482,9 @@ def train(args: argparse.Namespace):
                     f"lr {lr:.2e} | "
                     f"epoch_t {elapsed:.1f}s | "
                     f"wall {wall/60:.1f}min"
+                    + div_str
+                    + recon_str
+                    + contrast_str
                     + (f" | {mem}" if mem else "")
                 )
 

@@ -32,7 +32,8 @@ class InputProjection(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(d_out, d_out),
-            nn.LayerNorm(d_out),
+            # LayerNorm removed: normalising per-timestep erases amplitude
+            # differences between samples; the perceiver has its own norms.
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -182,15 +183,20 @@ class IMUAdapter(nn.Module):
         self,
         chronos_embeds: torch.Tensor,
         chronos_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             chronos_embeds: (B, S, d_chronos)
             chronos_mask:   (B, S) — True for padded positions
 
         Returns:
-            (B, n_soft_tokens, d_llm)
+            soft_tokens:    (B, n_soft_tokens, d_llm)   — LLM-space prefix
+            resampler_out:  (B, n_soft_tokens, adapter_dim) — pre-projection
+            projected_mean: (B, adapter_dim)             — mean of projected input;
+                            used as reconstruction target for the auxiliary loss
         """
-        x = self.proj(chronos_embeds)           # (B, S, adapter_dim)
-        x = self.resampler(x, chronos_mask)     # (B, n_soft_tokens, adapter_dim)
-        return self.out_proj(x)                 # (B, n_soft_tokens, d_llm)
+        x = self.proj(chronos_embeds)                # (B, S, adapter_dim)
+        projected_mean = x.mean(dim=1)               # (B, adapter_dim)
+        resampler_out = self.resampler(x, chronos_mask)  # (B, n_soft_tokens, adapter_dim)
+        soft_tokens = self.out_proj(resampler_out)   # (B, n_soft_tokens, d_llm)
+        return soft_tokens, resampler_out, projected_mean

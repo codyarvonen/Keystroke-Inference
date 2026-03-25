@@ -341,16 +341,35 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    encoded_splits = {}
     for split_name, raw_split in [("train", train_raw), ("val", val_raw), ("test", test_raw)]:
         if not raw_split:
             print(f"  [{split_name}] no samples, skipping")
+            encoded_splits[split_name] = []
             continue
-        encoded = encode_with_chronos(
+        encoded_splits[split_name] = encode_with_chronos(
             raw_split, args.chronos_model, args.batch_size, args.device
         )
+
+    # Mean-center Chronos embeddings using training-set statistics.
+    # Subtracting the mean removes the shared "background" direction that
+    # dominates Chronos output, leaving only discriminative residual variation.
+    train_encoded = encoded_splits.get("train", [])
+    if train_encoded:
+        train_mean = torch.stack(
+            [s["embeddings"].float().mean(0) for s in train_encoded]
+        ).mean(0)  # (d_chronos,)
+        print(f"\nMean-centering embeddings (d={train_mean.shape[0]}) using train statistics.")
+        for split_samples in encoded_splits.values():
+            for s in split_samples:
+                s["embeddings"] = (s["embeddings"].float() - train_mean).to(s["embeddings"].dtype)
+
+    for split_name, split_samples in encoded_splits.items():
+        if not split_samples:
+            continue
         out_path = output_dir / f"{split_name}.pt"
-        torch.save(encoded, str(out_path))
-        print(f"Saved {len(encoded)} {split_name} samples to {out_path}")
+        torch.save(split_samples, str(out_path))
+        print(f"Saved {len(split_samples)} {split_name} samples to {out_path}")
 
 
 if __name__ == "__main__":
