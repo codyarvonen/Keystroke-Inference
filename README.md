@@ -34,6 +34,10 @@ conda activate ring2text
 ### 1. Preprocess: raw data → Chronos embeddings
 
 ```bash
+# Using the config file (recommended)
+python preprocess.py --config configs/preprocess.yaml
+
+# Or with individual flags
 python preprocess.py \
     --raw_dir ./data \
     --output_dir ./embeddings \
@@ -44,15 +48,21 @@ python preprocess.py \
 
 Produces `embeddings/train.pt`, `val.pt`, `test.pt` (session-level splits). Applies per-channel z-score normalisation on raw IMU, then mean-centres Chronos embeddings using the training-set mean.
 
-Key options: `--ring {L,R,both}`, `--window_size`, `--step_size`, `--min_text_len`, `--target_hz`, `--no_normalize`, `--val_split`, `--test_split`
+Key options: `--chronos_model`, `--ring {L,R,both}`, `--window_size`, `--step_size`, `--min_text_len`, `--target_hz`, `--no_normalize`, `--val_split`, `--test_split`
+
+> **Switching Chronos model:** edit `chronos_model` in `configs/preprocess.yaml` and update `d_chronos` in `configs/default.yaml` to match (`embed_dim × n_channels`).
 
 ### 2. Train: fit the adapter
 
 ```bash
+# Using the config file (recommended)
+python train.py --config configs/default.yaml
+
+# Or with individual flags
 python train.py --data_file ./embeddings/train.pt --val_data_file ./embeddings/val.pt
 ```
 
-Saves `checkpoints/adapter_best.pt` and `checkpoints/adapter_final.pt`.
+CLI flags always override config file values. Saves `checkpoints/adapter_best.pt` and `checkpoints/adapter_final.pt`.
 
 Key defaults: `--llm Qwen/Qwen2.5-1.5B`, `--epochs 200`, `--lr 3e-5`, `--adapter_dropout 0.1`, `--max_grad_norm 0.5`, `--warmup_steps 200`, `--div_weight 10.0`, `--recon_weight 100.0`, `--contrast_weight 0.3`
 
@@ -95,6 +105,9 @@ python generate.py \
 ## Repository layout
 
 ```
+├── configs/
+│   ├── preprocess.yaml    # Preprocessing hyperparameters (Chronos model, windowing, splits)
+│   └── default.yaml       # Training hyperparameters (model, optimiser, losses)
 ├── preprocess.py          # IMU → Chronos embeddings (offline)
 ├── train.py               # Adapter training loop
 ├── generate.py            # Inference / text generation
