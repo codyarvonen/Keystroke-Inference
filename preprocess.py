@@ -26,7 +26,10 @@ Usage:
 
 import argparse
 import pickle
+import sys
 from pathlib import Path
+
+import yaml
 
 import torch
 import numpy as np
@@ -46,7 +49,10 @@ from utils.chronos_encode import encode_with_chronos
 
 def get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Preprocess IMU → Chronos embeddings")
-    p.add_argument("--raw_dir", type=str, required=True,
+    p.add_argument("--config", type=str, default=None,
+                   help="Path to a YAML config file (e.g. configs/preprocess.yaml). "
+                        "Values are used as defaults; explicit CLI flags override them.")
+    p.add_argument("--raw_dir", type=str, default=None,
                    help="Directory containing CSV and PKL data files")
     p.add_argument("--output_dir", type=str, default="./embeddings",
                    help="Directory to save train.pt, val.pt, test.pt")
@@ -73,7 +79,25 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--no_normalize", action="store_true",
                    help="Disable per-session per-channel z-score normalization "
                         "(normalization is ON by default)")
-    return p.parse_args()
+
+    args = p.parse_args()
+
+    # Load YAML config and use as defaults for any unset CLI flags
+    if args.config is not None:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        cli_argv = set()
+        for token in sys.argv[1:]:
+            if token.startswith("--"):
+                cli_argv.add(token.lstrip("-").split("=")[0])
+        for key, value in cfg.items():
+            if key not in cli_argv:
+                setattr(args, key, value)
+
+    if args.raw_dir is None:
+        p.error("--raw_dir is required (or set raw_dir in your config file)")
+
+    return args
 
 
 # ---------------------------------------------------------------------------

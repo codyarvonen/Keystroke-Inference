@@ -17,6 +17,8 @@ import time
 import datetime
 from pathlib import Path
 
+import yaml
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -53,6 +55,11 @@ def setup_logger(log_path: Path) -> logging.Logger:
 
 def get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train RingToText adapter")
+
+    # Config file
+    p.add_argument("--config", type=str, default=None,
+                   help="Path to a YAML config file (e.g. configs/default.yaml). "
+                        "Values are used as defaults; explicit CLI flags override them.")
 
     # Data
     p.add_argument("--data_dir", type=str, default=None)
@@ -133,7 +140,23 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--patience", type=int, default=5,
                    help="Early stopping: stop after this many val checks without improvement (0 = disabled)")
 
-    return p.parse_args()
+    args = p.parse_args()
+
+    # Load YAML config and use as defaults for any unset CLI flags
+    if args.config is not None:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        # Only override args that were not explicitly passed on the CLI
+        import sys
+        cli_argv = set()
+        for token in sys.argv[1:]:
+            if token.startswith("--"):
+                cli_argv.add(token.lstrip("-").split("=")[0])
+        for key, value in cfg.items():
+            if key not in cli_argv:
+                setattr(args, key, value)
+
+    return args
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,67 @@
+# RingToText training configuration
+# All values here are the defaults; override by passing --config or individual flags.
+
+# --------------------------------------------------------------------------- #
+#  Data
+# --------------------------------------------------------------------------- #
+data_dir: null
+data_file: "./embeddings/train.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val.pt"
+
+# --------------------------------------------------------------------------- #
+#  Model
+# --------------------------------------------------------------------------- #
+llm: "Qwen/Qwen2.5-1.5B"
+
+# Chronos model used during preprocessing (preprocess.py --chronos_model).
+# The embedding dim per channel varies by model size; d_chronos must match.
+#
+#   Model                          embed_dim   d_chronos (both rings)   d_chronos (one ring)
+#   amazon/chronos-t5-tiny             32            384                     192
+#   amazon/chronos-t5-mini            128           1536                     768
+#   amazon/chronos-t5-small           256           3072                    1536
+#   amazon/chronos-t5-base            768           9216                    4608   ← default
+#   amazon/chronos-t5-large          1024          12288                    6144
+#
+chronos_model: "amazon/chronos-t5-base"
+d_chronos: 9216          # 768 * n_channels (both rings); update when changing chronos_model or --ring
+n_soft_tokens: 32
+n_resampler_layers: 2
+prompt: null
+adapter_dim: 256          # Internal hidden dim; must be divisible by 8 (n_heads)
+adapter_dropout: 0.1
+
+# LoRA (LLM fine-tuning; set lora_rank > 0 to enable)
+lora_rank: 0
+lora_alpha: 16.0
+lora_dropout: 0.2
+lora_target_modules: null
+
+# --------------------------------------------------------------------------- #
+#  Training
+# --------------------------------------------------------------------------- #
+epochs: 200
+batch_size: 16
+lr: 3.0e-5
+weight_decay: 0.1
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 0.5
+
+# Auxiliary losses
+div_weight: 10.0          # Soft-token diversity loss weight (0 = disabled)
+recon_weight: 100.0       # Reconstruction loss weight (0 = disabled)
+contrast_weight: 0.3      # InfoNCE contrastive loss weight (0 = disabled)
+contrast_temp: 0.1        # Temperature for InfoNCE loss
+
+# --------------------------------------------------------------------------- #
+#  Logging / saving
+# --------------------------------------------------------------------------- #
+save_dir: "./checkpoints"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 3
+patience: 5               # Early stopping patience (0 = disabled)
