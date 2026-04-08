@@ -8,6 +8,8 @@ data_dir: null
 data_file: "./embeddings/train.pt"
 val_data_dir: null
 val_data_file: "./embeddings/val.pt"
+# Used by evaluate.py when loading this config (so eval does not pick train.pt)
+eval_data_file: "./embeddings/test.pt"
 
 # --------------------------------------------------------------------------- #
 #  Model
@@ -43,6 +45,7 @@ lora_target_modules: null
 # --------------------------------------------------------------------------- #
 epochs: 200
 batch_size: 16
+device: "cuda:1"
 lr: 3.0e-5
 weight_decay: 0.1
 warmup_steps: 200
@@ -65,3 +68,6 @@ val_every: 500
 save_every: 1000
 n_generate_samples: 3
 patience: 5               # Early stopping patience (0 = disabled)
+
+# Teacher-forced token top-K accuracy during validation (empty list = disabled)
+eval_topk: [1, 5, 10]

@@ -28,7 +28,7 @@ seed: 42                  # Random seed for session shuffle
 #
 chronos_model: "amazon/chronos-t5-base"
 batch_size: 32
-device: "cuda"
+device: "cuda:1"
 
 # --------------------------------------------------------------------------- #
 #  IMU windowing

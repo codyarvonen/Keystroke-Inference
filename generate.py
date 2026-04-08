@@ -30,6 +30,8 @@ def get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="RingToText inference")
     p.add_argument("--adapter_path", type=str, required=True)
     p.add_argument("--llm", type=str, default=RingToText.__init__.__defaults__[0])
+    p.add_argument("--device", type=str, default="cuda",
+                   help="Device string, e.g. 'cuda', 'cuda:1', or 'cpu'")
     p.add_argument("--d_chronos", type=int, default=9216,
                    help="Chronos output dim: 768 * n_channels (9216 for both rings, 4608 for one)")
     p.add_argument("--n_soft_tokens", type=int, default=32)
@@ -88,7 +90,11 @@ def _load_samples_from_raw(args) -> list[dict]:
 
 def main():
     args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available; falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
 
     print(f"Loading model ({args.llm})...")
     model = RingToText(

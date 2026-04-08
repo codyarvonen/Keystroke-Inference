@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import logging
 import math
 import time
@@ -25,6 +26,7 @@ from torch.utils.data import DataLoader
 
 from model import RingToText
 from dataset import IMUTextDataset, collate_fn
+from eval_metrics import empty_topk_accum, finalize_token_topk, token_topk_update
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +95,8 @@ def get_args() -> argparse.Namespace:
     # Training
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--device", type=str, default="cuda",
+                   help="Device string, e.g. 'cuda', 'cuda:1', or 'cpu'")
     p.add_argument("--lr", type=float, default=3e-5,
                    help="Learning rate (default: 3e-5; was 1e-4 but caused exploding grad norms)")
     p.add_argument("--weight_decay", type=float, default=0.1)
@@ -139,6 +143,9 @@ def get_args() -> argparse.Namespace:
                    help="Number of samples to generate during validation")
     p.add_argument("--patience", type=int, default=5,
                    help="Early stopping: stop after this many val checks without improvement (0 = disabled)")
+    p.add_argument("--eval_topk", type=int, nargs="+", default=[1, 5, 10],
+                   help="K values for teacher-forced top-K token accuracy during validation "
+                        "(empty list disables).")
 
     args = p.parse_args()
 
@@ -195,6 +202,12 @@ def cosine_lr(step: int, warmup: int, total: int, lr: float) -> float:
     return lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
+def _autocast_ctx(device: torch.device):
+    if device.type == "cuda" and torch.cuda.is_available():
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 # --------------------------------------------------------------------------- #
 #  Validation
 # --------------------------------------------------------------------------- #
@@ -206,6 +219,7 @@ def validate(
     device: torch.device,
     n_generate: int = 3,
     logger: logging.Logger = None,
+    eval_topk: list[int] | None = None,
 ) -> dict:
     log = logger.info if logger else print
 
@@ -215,6 +229,8 @@ def validate(
 
     total_loss = 0.0
     n_batches = 0
+    ks = [k for k in (eval_topk or []) if k > 0]
+    topk_accum = empty_topk_accum(ks) if ks else None
 
     for batch in val_loader:
         chronos_embeds = batch["chronos_embeds"].to(device)
@@ -222,12 +238,18 @@ def validate(
         target_ids = batch["target_ids"].to(device)
         labels = batch["target_labels"].to(device)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            out = model(chronos_embeds, target_ids, chronos_mask, labels)
-        total_loss += out["loss"].item()
+        with _autocast_ctx(device):
+            model_out = model(chronos_embeds, target_ids, chronos_mask, labels)
+        total_loss += model_out["loss"].item()
         n_batches += 1
+        if topk_accum is not None:
+            token_topk_update(model_out["logits"], labels, ks, topk_accum)
 
     avg_loss = total_loss / max(n_batches, 1)
+
+    topk_metrics: dict[str, float] = {}
+    if topk_accum is not None:
+        topk_metrics = finalize_token_topk(topk_accum, ks)
 
     # Generate samples for qualitative inspection
     generated_samples = []
@@ -257,7 +279,9 @@ def validate(
     if model.lora_enabled:
         model.llm.train()
 
-    return {"val_loss": avg_loss, "mean_cer": mean_cer, "samples": generated_samples}
+    result = {"val_loss": avg_loss, "mean_cer": mean_cer, "samples": generated_samples}
+    result.update(topk_metrics)
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -277,7 +301,11 @@ def gpu_mem_str() -> str:
 # --------------------------------------------------------------------------- #
 
 def train(args: argparse.Namespace):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        print("WARNING: CUDA requested but not available; falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -519,7 +547,12 @@ def train(args: argparse.Namespace):
             ):
                 logger.info(f"--- Validation at step {global_step} ---")
                 val_result = validate(
-                    model, val_loader, device, args.n_generate_samples, logger
+                    model,
+                    val_loader,
+                    device,
+                    args.n_generate_samples,
+                    logger,
+                    eval_topk=args.eval_topk,
                 )
                 val_loss = val_result["val_loss"]
                 improved = val_loss < best_val_loss
@@ -527,17 +560,24 @@ def train(args: argparse.Namespace):
                 mean_cer = val_result["mean_cer"]
                 cer_str = f"  mean_CER: {mean_cer:.3f}" if not math.isnan(mean_cer) else ""
 
+                topk_parts = []
+                for k in args.eval_topk:
+                    key = f"top{k}_acc"
+                    if key in val_result and not math.isnan(val_result[key]):
+                        topk_parts.append(f"{key}={val_result[key]:.4f}")
+                topk_str = ("  " + " ".join(topk_parts)) if topk_parts else ""
+
                 if improved:
                     best_val_loss = val_loss
                     no_improve_count = 0
                     model.save_adapter(str(best_ckpt_path))
                     logger.info(
-                        f"  val_loss: {val_loss:.4f}{cer_str}  [BEST] saved {best_ckpt_path.name}"
+                        f"  val_loss: {val_loss:.4f}{cer_str}{topk_str}  [BEST] saved {best_ckpt_path.name}"
                     )
                 else:
                     no_improve_count += 1
                     logger.info(
-                        f"  val_loss: {val_loss:.4f}{cer_str}  "
+                        f"  val_loss: {val_loss:.4f}{cer_str}{topk_str}  "
                         f"[no improvement {no_improve_count}/{args.patience}, "
                         f"best={best_val_loss:.4f}]"
                     )
