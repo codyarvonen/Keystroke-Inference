@@ -73,7 +73,10 @@ def _load_samples_from_raw(args) -> list[dict]:
     """Run preprocess pipeline on raw data and return encoded samples."""
     from preprocess import _load_raw_samples
     from utils.chronos_encode import encode_with_chronos
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
     session_map = _load_raw_samples(
         raw_dir=args.raw_dir,
         window_size=args.window_size,
@@ -88,14 +91,21 @@ def _load_samples_from_raw(args) -> list[dict]:
 
 def main():
     args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
 
     print(f"Loading model ({args.llm})...")
+    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = RingToText(
         llm_name=args.llm,
         d_chronos=args.d_chronos,
         n_soft_tokens=args.n_soft_tokens,
         n_resampler_layers=args.n_resampler_layers,
+        dtype=model_dtype,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,

@@ -18,14 +18,14 @@ llm: "Qwen/Qwen2.5-1.5B"
 # The embedding dim per channel varies by model size; d_chronos must match.
 #
 #   Model                          embed_dim   d_chronos (both rings)   d_chronos (one ring)
-#   amazon/chronos-t5-tiny             32            384                     192
-#   amazon/chronos-t5-mini            128           1536                     768
-#   amazon/chronos-t5-small           256           3072                    1536
-#   amazon/chronos-t5-base            768           9216                    4608   ← default
+#   amazon/chronos-t5-tiny            256           3072                    1536
+#   amazon/chronos-t5-mini            384           4608                    2304
+#   amazon/chronos-t5-small           512           6144                    3072
+#   amazon/chronos-t5-base            768           9216                    4608
 #   amazon/chronos-t5-large          1024          12288                    6144
 #
 chronos_model: "amazon/chronos-t5-base"
-d_chronos: 9216          # 768 * n_channels (both rings); update when changing chronos_model or --ring
+d_chronos: 9216           # 768 * 12 channels (both rings); update when changing chronos_model or --ring
 n_soft_tokens: 32
 n_resampler_layers: 2
 prompt: null

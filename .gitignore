@@ -3,6 +3,10 @@ __pycache__/
 .venv/
 venv/
 env/
+ring2text_env/
 .ipynb_checkpoints/
 .env
 data/
+embeddings/
+embeddings_*/
+checkpoints/

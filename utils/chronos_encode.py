@@ -1,5 +1,7 @@
 """Chronos-based IMU encoding utilities."""
 
+import time
+
 import torch
 import numpy as np
 
@@ -15,15 +17,30 @@ def _encode_multichannel(pipeline, imu_data: np.ndarray) -> torch.Tensor:
         imu_data: (n_timesteps, n_channels)
 
     Returns:
-        (S, 768 * n_channels) — concatenated per-channel Chronos embeddings
+        (S, embed_dim * n_channels) — concatenated per-channel Chronos embeddings
     """
     n_channels = imu_data.shape[1]
     channel_embeddings = []
     for ch in range(n_channels):
         series = torch.tensor(imu_data[:, ch], dtype=torch.float32).unsqueeze(0)
-        embedding, _ = pipeline.embed(series)  # pipeline moves to GPU via device_map
-        channel_embeddings.append(embedding.squeeze(0))  # (S, 768)
-    return torch.cat(channel_embeddings, dim=-1)  # (S, 768 * n_channels)
+        embedding, _ = pipeline.embed(series)
+        channel_embeddings.append(embedding.squeeze(0))
+    return torch.cat(channel_embeddings, dim=-1)
+
+
+def _load_or_create_pipeline(model_name: str, device: str):
+    """Load Chronos pipeline once (cached as module-level singleton)."""
+    global _chronos_pipeline, _chronos_pipeline_name
+    if "_chronos_pipeline" not in globals() or _chronos_pipeline_name != model_name:
+        from chronos import ChronosPipeline
+        print(f"Loading Chronos model: {model_name}")
+        model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        _chronos_pipeline = ChronosPipeline.from_pretrained(
+            model_name, device_map=device, dtype=model_dtype,
+        )
+        globals()["_chronos_pipeline_name"] = model_name
+        print("Chronos model loaded.")
+    return _chronos_pipeline
 
 
 def encode_with_chronos(
@@ -36,7 +53,10 @@ def encode_with_chronos(
 
     Each IMU channel is encoded independently; embeddings are concatenated
     along the feature dimension:
-        output shape: (S, 768 * n_channels)   ← this is d_chronos
+        output shape: (S, embed_dim * n_channels)   ← this is d_chronos
+
+    Embeddings are stored in float16 to reduce memory usage (~3x savings).
+    They are cast back to the working dtype during training.
 
     Args:
         samples:    list of {'imu': np.ndarray, 'text': str}
@@ -45,22 +65,21 @@ def encode_with_chronos(
         device:     device string passed to ChronosPipeline.from_pretrained
 
     Returns:
-        list of {'embeddings': torch.Tensor (cpu), 'text': str}
+        list of {'embeddings': torch.Tensor (cpu, float16), 'text': str}
     """
-    from chronos import ChronosPipeline
+    pipeline = _load_or_create_pipeline(model_name, device)
+    print(f"Encoding {len(samples)} samples...")
 
-    print(f"Loading Chronos model: {model_name}")
-    pipeline = ChronosPipeline.from_pretrained(
-        model_name,
-        device_map=device,
-        dtype=torch.bfloat16,
-    )
     results = []
-    for i in range(0, len(samples), batch_size):
-        batch = samples[i: i + batch_size]
-        for sample in batch:
-            emb = _encode_multichannel(pipeline, sample["imu"])
-            results.append({"embeddings": emb.cpu(), "text": sample["text"]})
-        print(f"  encoded {min(i + batch_size, len(samples))}/{len(samples)}")
+    t0 = time.time()
+    for i, sample in enumerate(samples):
+        emb = _encode_multichannel(pipeline, sample["imu"])
+        results.append({"embeddings": emb.cpu().half(), "text": sample["text"]})
+        if (i + 1) % 10 == 0 or (i + 1) == len(samples):
+            elapsed = time.time() - t0
+            rate = (i + 1) / elapsed
+            eta = (len(samples) - i - 1) / rate
+            print(f"  encoded {i+1}/{len(samples)}  ({rate:.1f} samples/s, ETA {eta:.0f}s)",
+                  flush=True)
 
     return results

@@ -65,7 +65,8 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--chronos_model", type=str, default=CHRONOS_DEFAULT_MODEL,
                    help="Chronos model ID from HuggingFace")
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default=None,
+                   help="Device for Chronos encoding (auto-detects cuda > mps > cpu)")
     p.add_argument("--ring", type=str, default="both", choices=["L", "R", "both"],
                    help="Which ring(s) to encode. 'both' concatenates L+R channels.")
     p.add_argument("--window_size", type=float, default=10.0,
@@ -96,6 +97,14 @@ def get_args() -> argparse.Namespace:
 
     if args.raw_dir is None:
         p.error("--raw_dir is required (or set raw_dir in your config file)")
+
+    if args.device is None:
+        if torch.cuda.is_available():
+            args.device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            args.device = "cpu"  # Chronos T5 models work more reliably on CPU than MPS
+        else:
+            args.device = "cpu"
 
     return args
 
@@ -356,7 +365,7 @@ def main():
 
     first = next(s for v in session_map.values() for s in v)
     n_channels = first["imu"].shape[1]
-    print(f"IMU channels per sample: {n_channels}  →  d_chronos = 768 * {n_channels} = {768 * n_channels}")
+    print(f"IMU channels per sample: {n_channels}  →  d_chronos = embed_dim * {n_channels} (depends on Chronos model)")
 
     train_raw, val_raw, test_raw = _split_sessions(
         session_map, args.val_split, args.test_split, args.seed

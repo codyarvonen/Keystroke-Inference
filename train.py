@@ -222,7 +222,8 @@ def validate(
         target_ids = batch["target_ids"].to(device)
         labels = batch["target_labels"].to(device)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        use_autocast = device.type == "cuda"
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
             out = model(chronos_embeds, target_ids, chronos_mask, labels)
         total_loss += out["loss"].item()
         n_batches += 1
@@ -237,7 +238,7 @@ def validate(
         mask = sample_batch["chronos_mask"][:n_generate].to(device)
         targets = sample_batch["target_ids"][:n_generate]
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
             predictions = model.generate(embeds, mask, max_new_tokens=64)
 
         for i in range(min(n_generate, len(predictions))):
@@ -277,7 +278,10 @@ def gpu_mem_str() -> str:
 # --------------------------------------------------------------------------- #
 
 def train(args: argparse.Namespace):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -301,12 +305,14 @@ def train(args: argparse.Namespace):
 
     # ---- Model ----
     logger.info(f"Loading model: {args.llm}")
+    model_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     model = RingToText(
         llm_name=args.llm,
         d_chronos=args.d_chronos,
         n_soft_tokens=args.n_soft_tokens,
         n_resampler_layers=args.n_resampler_layers,
         prompt=args.prompt,
+        dtype=model_dtype,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
@@ -338,13 +344,14 @@ def train(args: argparse.Namespace):
         tokenizer=model.tokenizer,
         max_text_len=args.max_text_len,
     )
+    use_cuda = device.type == "cuda"
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=4 if use_cuda else 0,
+        pin_memory=use_cuda,
     )
     logger.info(f"Train samples: {len(train_ds):,}  |  batches/epoch: {len(train_loader)}")
 
@@ -361,8 +368,8 @@ def train(args: argparse.Namespace):
             batch_size=args.batch_size,
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=2,
-            pin_memory=True,
+            num_workers=2 if use_cuda else 0,
+            pin_memory=use_cuda,
         )
         logger.info(f"Val samples:   {len(val_ds):,}  |  batches: {len(val_loader)}")
     logger.info("-" * 70)
@@ -416,7 +423,8 @@ def train(args: argparse.Namespace):
                 pg["lr"] = lr
 
             # Forward
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            use_autocast = device.type == "cuda"
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_autocast):
                 out = model(chronos_embeds, target_ids, chronos_mask, labels)
                 loss = out["loss"]
 
