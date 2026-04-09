@@ -52,6 +52,25 @@ Key options: `--chronos_model`, `--ring {L,R,both}`, `--window_size`, `--step_si
 
 > **Switching Chronos model:** edit `chronos_model` in `configs/preprocess.yaml` and update `d_chronos` in `configs/default.yaml` to match (`embed_dim × n_channels`).
 
+#### Windowing exploration
+
+Different window sizes control prediction difficulty and dataset size. Generate embeddings for each configuration, then train and compare val loss:
+
+```bash
+# 10s windows (default): ~1,391 train samples, ~34 chars/sample
+python preprocess.py --config configs/preprocess.yaml
+
+# 5s windows: ~2,406 train samples, ~20 chars/sample
+python preprocess.py --config configs/preprocess.yaml \
+    --window_size 5.0 --step_size 2.5 --output_dir ./embeddings_5s
+
+# 3s windows: ~3,400 train samples, ~14 chars/sample
+python preprocess.py --config configs/preprocess.yaml \
+    --window_size 3.0 --step_size 1.5 --output_dir ./embeddings_3s
+```
+
+Shorter windows yield more training samples and a simpler prediction task (fewer characters to reconstruct per window), at the cost of less IMU context. Train on each and point `--data_file` / `--val_data_file` to the corresponding directory.
+
 ### 2. Train: fit the adapter
 
 ```bash
