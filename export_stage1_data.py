@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""
+Export Stage-1 JSONL shards + train-only vocab (M2).
+
+Writes:
+  out_dir/vocab.json
+  out_dir/train.jsonl, val.jsonl, test.jsonl
+  out_dir/manifest.json
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+from data_loader.config import Stage1ExportConfig
+from data_loader.stage1 import export_stage1_to_dir
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Export Stage-1 rows and vocabulary.")
+    p.add_argument("--out-dir", type=str, default="stage1_export", help="Output directory")
+    p.add_argument("--data-dir", type=str, default="data")
+    p.add_argument("--left-ms", type=int, default=700)
+    p.add_argument("--right-ms", type=int, default=150)
+    p.add_argument("--target-rate-hz", type=float, default=100.0)
+    p.add_argument(
+        "--session-split-strategy",
+        choices=["session_random", "session_holdout"],
+        default="session_random",
+    )
+    p.add_argument("--test-sessions", nargs="*", default=[])
+    p.add_argument("--val-sessions", nargs="*", default=[])
+    p.add_argument("--val-ratio", type=float, default=0.2)
+    p.add_argument("--split-seed", type=int, default=42)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = Stage1ExportConfig(
+        data_dir=args.data_dir,
+        left_context_ms=args.left_ms,
+        right_context_ms=args.right_ms,
+        target_rate_hz=args.target_rate_hz,
+        session_split_strategy=args.session_split_strategy,  # type: ignore[arg-type]
+        test_sessions=args.test_sessions,
+        val_sessions=args.val_sessions,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
+    )
+    out_dir = Path(args.out_dir)
+    manifest = export_stage1_to_dir(cfg, out_dir)
+
+    print(f"Wrote export under {out_dir.resolve()}")
+    print(f"  vocab_size: {manifest['vocab_size']}")
+    print(f"  rows_written: {manifest['rows_written']}")
+    print(f"  unk_label_count_by_split: {manifest['unk_label_count_by_split']}")
+
+    vocab_path = out_dir / "vocab.json"
+    v = json.loads(vocab_path.read_text(encoding="utf-8"))
+    print(f"  special_tokens: {v.get('special_tokens')}")
+
+
+if __name__ == "__main__":
+    main()

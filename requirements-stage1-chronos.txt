@@ -1,0 +1,2 @@
+# Stage-1 Chronos encoder + head (in addition to base torch/numpy stack)
+chronos-forecasting>=2.0

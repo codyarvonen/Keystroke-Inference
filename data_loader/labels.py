@@ -1,10 +1,12 @@
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 import numpy as np
-from transformers import GPT2TokenizerFast
 
 from .config import DataConfig
 from .windows import WindowRecord
+
+if TYPE_CHECKING:
+    from transformers import GPT2TokenizerFast
 
 
 def regenerate_key_sequence_for_session(keystroke_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -269,7 +271,7 @@ def attach_labels_to_windows(
     windows: List[WindowRecord],
     keystroke_data: Dict[str, Any],
     cfg: DataConfig,
-    tokenizer: GPT2TokenizerFast,
+    tokenizer: "GPT2TokenizerFast",
 ) -> List[WindowRecord]:
     """
     Populate raw_key_sequence / clean_text / token_ids on each window.

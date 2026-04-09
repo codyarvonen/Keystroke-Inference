@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Sequence, Tuple
 
@@ -6,6 +6,7 @@ from typing import Literal, Optional, Sequence, Tuple
 SplitStrategy = Literal["LOSO", "LOPO", "random"]
 TargetVariant = Literal["raw_keystrokes", "clean_text", "clean_tokens"]
 RingsUsed = Literal["L", "R", "both"]
+SessionSplitStrategy = Literal["session_random", "session_holdout"]
 
 
 @dataclass
@@ -37,6 +38,32 @@ class DataConfig:
     split_seed: int = 42
 
     # Optional restrictions for experiments
+    include_sessions: Optional[Sequence[str]] = None
+    exclude_sessions: Optional[Sequence[str]] = None
+
+
+@dataclass
+class Stage1ExportConfig:
+    """
+    Stage-1 preprocessing/export config for per-key IMU windows.
+    """
+
+    data_dir: str = "data"
+    rings_used: RingsUsed = "both"
+    target_rate_hz: float = 100.0
+
+    # Causal-biased key-centered window: [press - left_ms, press + right_ms]
+    left_context_ms: int = 700
+    right_context_ms: int = 150
+
+    # Session-based split control (explicit strategy)
+    session_split_strategy: SessionSplitStrategy = "session_random"
+    test_sessions: Sequence[str] = field(default_factory=tuple)
+    val_sessions: Sequence[str] = field(default_factory=tuple)
+    val_ratio: float = 0.2
+    split_seed: int = 42
+
+    # Optional session filters for experiments
     include_sessions: Optional[Sequence[str]] = None
     exclude_sessions: Optional[Sequence[str]] = None
 
