@@ -1,0 +1,44 @@
+# Stage-1 Chronos + linear head — default training settings.
+# Copy this file (e.g. configs/my_run.yaml), edit, and run:
+#   python train_stage1_chronos.py --config configs/my_run.yaml
+# CLI flags override values from the file.
+#
+# Keys are the same as in train_stage1_chronos.TRAINING_DEFAULTS. You may group
+# them under arbitrary section headings (paths:, training:, …); unknown keys warn.
+
+paths:
+  export_dir: stage1_export
+  data_dir: data
+  out_dir: checkpoints/stage1_chronos
+  log_file: null  # default: <out_dir>/train_<timestamp>.log (new file each run)
+
+model:
+  chronos_model: autogluon/chronos-2-small
+  device: cuda:1
+  freeze_encoder: true
+  use_embedding_cache: true
+  embedding_cache_dir: null  # default: <out_dir>/embedding_cache
+  recompute_embedding_cache: false
+  cache_test_embeddings: true
+  context_length: 256
+
+window:
+  left_ms: 700
+  right_ms: 150
+  target_rate_hz: 100.0
+
+training:
+  epochs: 100
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 0.01
+  num_workers: 4
+  seed: 42
+
+early_stopping:
+  patience: 5  # 0 = run all epochs; set e.g. 5 to stop when val plateaus
+  min_delta: 0.0
+  early_stopping_metric: val_loss  # or val_top1
+
+norm:
+  recompute_norm: false
