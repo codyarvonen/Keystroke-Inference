@@ -36,6 +36,19 @@ def regenerate_key_sequence_for_session(keystroke_data: Dict[str, Any]) -> List[
     return events
 
 
+def normalize_key_token_case(key_token: str, merge_letter_case: bool) -> str:
+    """
+    When merge_letter_case is True, map single alphabetic characters to lowercase so
+    uppercase and lowercase letters share one class. Special tokens (e.g. <SHIFT>, ' ')
+    and multi-character names are unchanged.
+    """
+    if not merge_letter_case:
+        return key_token
+    if len(key_token) == 1 and key_token.isalpha():
+        return key_token.lower()
+    return key_token
+
+
 def parse_key_name(key_str: str) -> str:
     special_keys = {
         "Key.space": " ",

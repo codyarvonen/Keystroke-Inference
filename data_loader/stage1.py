@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from .config import DataConfig, Stage1ExportConfig
-from .labels import parse_key_name, regenerate_key_sequence_for_session
+from .coarse_labels import build_fixed_coarse_32_vocab, map_key_token_to_coarse_32
+from .labels import normalize_key_token_case, parse_key_name, regenerate_key_sequence_for_session
 from .sessions import discover_sessions, load_session_raw
 from .windows import align_rings_to_grid
 
@@ -166,7 +167,9 @@ def build_stage1_rows(
             key_press_ts = float(event["timestamp"])
             key_release_ts = event.get("end")
             key_raw = str(event["key"])
-            key_token = parse_key_name(key_raw)
+            key_token = normalize_key_token_case(parse_key_name(key_raw), cfg.merge_letter_case)
+            if cfg.coarse_labels:
+                key_token = map_key_token_to_coarse_32(key_token)
 
             stats["keys_total"] += 1
             sess_stats["keys_total"] += 1
@@ -243,6 +246,18 @@ def build_stage1_vocab_from_train(
     return token_to_id, id_to_token
 
 
+def build_stage1_vocab(
+    rows: Sequence[Stage1KeyWindowRow],
+    cfg: Stage1ExportConfig,
+) -> Tuple[Dict[str, int], List[str]]:
+    """
+    Full-vocab mode: train-only tokens. Coarse mode: fixed 32 classes (+ PAD/UNK).
+    """
+    if cfg.coarse_labels:
+        return build_fixed_coarse_32_vocab()
+    return build_stage1_vocab_from_train(rows)
+
+
 def encode_key_token(key_token: str, token_to_id: Mapping[str, int]) -> int:
     return int(token_to_id.get(key_token, token_to_id[STAGE1_UNK_TOKEN]))
 
@@ -250,17 +265,26 @@ def encode_key_token(key_token: str, token_to_id: Mapping[str, int]) -> int:
 def vocab_to_serializable(
     token_to_id: Mapping[str, int],
     id_to_token: Sequence[str],
+    label_scheme: str | None = None,
 ) -> Dict[str, Any]:
-    return {
+    out: Dict[str, Any] = {
         "token_to_id": dict(token_to_id),
         "id_to_token": list(id_to_token),
         "special_tokens": [STAGE1_PAD_TOKEN, STAGE1_UNK_TOKEN],
     }
+    if label_scheme is not None:
+        out["label_scheme"] = label_scheme
+    return out
 
 
-def save_stage1_vocab(path: Path, token_to_id: Mapping[str, int], id_to_token: Sequence[str]) -> None:
+def save_stage1_vocab(
+    path: Path,
+    token_to_id: Mapping[str, int],
+    id_to_token: Sequence[str],
+    label_scheme: str | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = vocab_to_serializable(token_to_id, id_to_token)
+    payload = vocab_to_serializable(token_to_id, id_to_token, label_scheme=label_scheme)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -283,6 +307,32 @@ def row_to_export_record(
     return d
 
 
+def stage1_export_config_from_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    data_dir: Optional[str] = None,
+) -> Stage1ExportConfig:
+    """
+    Build Stage1ExportConfig from manifest.json written by export_stage1_to_dir.
+    Use this so validation/eval use the same settings as the export (including merge_letter_case).
+    """
+    c = manifest.get("config", {})
+    return Stage1ExportConfig(
+        data_dir=data_dir if data_dir is not None else str(c.get("data_dir", "data")),
+        rings_used=c.get("rings_used", "both"),  # type: ignore[arg-type]
+        target_rate_hz=float(c.get("target_rate_hz", 100.0)),
+        left_context_ms=int(c.get("left_context_ms", 700)),
+        right_context_ms=int(c.get("right_context_ms", 150)),
+        session_split_strategy=c.get("session_split_strategy", "session_random"),  # type: ignore[arg-type]
+        test_sessions=tuple(c.get("test_sessions") or ()),
+        val_sessions=tuple(c.get("val_sessions") or ()),
+        val_ratio=float(c.get("val_ratio", 0.2)),
+        split_seed=int(c.get("split_seed", 42)),
+        merge_letter_case=bool(c.get("merge_letter_case", False)),
+        coarse_labels=bool(c.get("coarse_labels", False)),
+    )
+
+
 def export_stage1_to_dir(
     cfg: Stage1ExportConfig,
     out_dir: str | Path,
@@ -294,8 +344,9 @@ def export_stage1_to_dir(
     out.mkdir(parents=True, exist_ok=True)
 
     rows, stats = build_stage1_rows(cfg)
-    token_to_id, id_to_token = build_stage1_vocab_from_train(rows)
-    save_stage1_vocab(out / "vocab.json", token_to_id, id_to_token)
+    token_to_id, id_to_token = build_stage1_vocab(rows, cfg)
+    label_scheme = "coarse_32" if cfg.coarse_labels else None
+    save_stage1_vocab(out / "vocab.json", token_to_id, id_to_token, label_scheme=label_scheme)
 
     by_split: Dict[str, List[Stage1KeyWindowRow]] = {"train": [], "val": [], "test": []}
     for r in rows:
@@ -327,6 +378,8 @@ def export_stage1_to_dir(
             "session_split_strategy": cfg.session_split_strategy,
             "val_ratio": cfg.val_ratio,
             "split_seed": cfg.split_seed,
+            "merge_letter_case": cfg.merge_letter_case,
+            "coarse_labels": cfg.coarse_labels,
         },
         "build_stats": stats,
         "vocab_size": len(token_to_id),

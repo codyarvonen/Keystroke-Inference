@@ -3,9 +3,11 @@ from .splits import make_splits
 from .stage1 import (
     Stage1KeyWindowRow,
     build_stage1_rows,
+    build_stage1_vocab,
     build_stage1_vocab_from_train,
     export_stage1_to_dir,
     load_stage1_vocab,
+    stage1_export_config_from_manifest,
 )
 from .windows import WindowRecord
 
@@ -31,9 +33,11 @@ __all__ = [
     "Stage1IMUKeyDataset",
     "build_all_windows",
     "build_stage1_rows",
+    "build_stage1_vocab",
     "build_stage1_vocab_from_train",
     "export_stage1_to_dir",
     "load_stage1_vocab",
+    "stage1_export_config_from_manifest",
     "make_dataloaders",
     "make_splits",
 ]

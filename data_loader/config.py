@@ -67,6 +67,12 @@ class Stage1ExportConfig:
     include_sessions: Optional[Sequence[str]] = None
     exclude_sessions: Optional[Sequence[str]] = None
 
+    # If True, single-letter alphabetic key tokens are lowercased so e.g. 'A' and 'a' share one class.
+    merge_letter_case: bool = False
+
+    # If True, collapse labels to 32 classes: a–z, space, backspace, shift, punctuation, digits, other.
+    coarse_labels: bool = False
+
 
 def parse_subject_session(filename: str) -> Tuple[str, str]:
     """

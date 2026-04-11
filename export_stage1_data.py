@@ -32,6 +32,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-sessions", nargs="*", default=[])
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--split-seed", type=int, default=42)
+    p.add_argument(
+        "--merge-letter-case",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Lowercase single-letter alphabetic keys so 'A' and 'a' share one class (default: off)",
+    )
+    p.add_argument(
+        "--coarse-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Collapse to 32 classes: a–z, space, backspace, shift, punct, digits, other (recommended with --merge-letter-case)",
+    )
     return p.parse_args()
 
 
@@ -47,6 +59,8 @@ def main() -> None:
         val_sessions=args.val_sessions,
         val_ratio=args.val_ratio,
         split_seed=args.split_seed,
+        merge_letter_case=args.merge_letter_case,
+        coarse_labels=args.coarse_labels,
     )
     out_dir = Path(args.out_dir)
     manifest = export_stage1_to_dir(cfg, out_dir)

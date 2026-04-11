@@ -1,21 +1,38 @@
 #!/usr/bin/env python3
 """
 Validate Stage-1 keypress-to-IMU alignment and export schema readiness.
+
+Rebuilds rows from raw session files under --data-dir (same code path as export), not from
+JSONL shards. Use --export-dir path/to/stage1_export to load manifest.json so settings
+(including merge_letter_case) match that export.
 """
 
 import argparse
 import json
 from collections import Counter
+from pathlib import Path
 
 from data_loader.config import Stage1ExportConfig
-from data_loader.stage1 import build_stage1_rows
+from data_loader.stage1 import build_stage1_rows, stage1_export_config_from_manifest
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate Stage-1 keypress timestamp alignment and per-key IMU windows."
     )
-    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument(
+        "--export-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help="Load Stage1ExportConfig from DIR/manifest.json (matches export; includes merge_letter_case).",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Raw data root (default: 'data', or from manifest when using --export-dir)",
+    )
     parser.add_argument("--left-ms", type=int, default=700)
     parser.add_argument("--right-ms", type=int, default=150)
     parser.add_argument("--target-rate-hz", type=float, default=100.0)
@@ -38,6 +55,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument(
+        "--merge-letter-case",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Lowercase single-letter keys so A/a share one label (must match export)",
+    )
+    parser.add_argument(
+        "--coarse-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="32-class coarse labels (a–z + space/backspace/shift/punct/num/other); must match export",
+    )
     parser.add_argument("--show-samples", type=int, default=8)
     parser.add_argument("--show-label-topk", type=int, default=20)
     return parser.parse_args()
@@ -45,17 +74,30 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cfg = Stage1ExportConfig(
-        data_dir=args.data_dir,
-        left_context_ms=args.left_ms,
-        right_context_ms=args.right_ms,
-        target_rate_hz=args.target_rate_hz,
-        session_split_strategy=args.session_split_strategy,  # type: ignore[arg-type]
-        test_sessions=args.test_sessions,
-        val_sessions=args.val_sessions,
-        val_ratio=args.val_ratio,
-        split_seed=args.split_seed,
-    )
+    if args.export_dir:
+        manifest_path = Path(args.export_dir) / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        cfg = stage1_export_config_from_manifest(manifest, data_dir=args.data_dir)
+        print(
+            f"Config from manifest: {manifest_path.resolve()} "
+            f"(merge_letter_case={cfg.merge_letter_case}, coarse_labels={cfg.coarse_labels})"
+        )
+    else:
+        cfg = Stage1ExportConfig(
+            data_dir=args.data_dir or "data",
+            left_context_ms=args.left_ms,
+            right_context_ms=args.right_ms,
+            target_rate_hz=args.target_rate_hz,
+            session_split_strategy=args.session_split_strategy,  # type: ignore[arg-type]
+            test_sessions=args.test_sessions,
+            val_sessions=args.val_sessions,
+            val_ratio=args.val_ratio,
+            split_seed=args.split_seed,
+            merge_letter_case=args.merge_letter_case,
+            coarse_labels=args.coarse_labels,
+        )
 
     rows, stats = build_stage1_rows(cfg)
 
