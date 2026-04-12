@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Stage-1 training: frozen Chronos-2 encoder embeddings + linear classification head.
+Stage-1 training: frozen Chronos-2 encoder embeddings + configurable classification head.
 
 Requires: pip install "chronos-forecasting>=2.0" pyyaml
 
 Uses Chronos2Pipeline.embed() for encoder features (multivariate IMU as 12 variates).
-With embedding cache, stores pre-pool tokens (B×V×L×D); pooling runs each step so you can swap heads/pooling later.
+With embedding cache, stores pre-pool tokens (B×V×L×D); default storage is on-disk memmap
+(low RAM). Heads consume full tokens (MLP, attention pool, Conv1d, BiLSTM, etc.) or legacy
+pooled (B×D) for linear heads.
 
 Defaults can be loaded from a YAML file: --config configs/stage1_chronos.defaults.yaml
 (CLI flags override). See TRAINING_DEFAULTS and configs/stage1_chronos.defaults.yaml.
@@ -33,8 +35,7 @@ except ImportError:  # pragma: no cover
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from data_loader.config import Stage1ExportConfig
 from data_loader.stage1 import load_stage1_vocab
@@ -46,6 +47,12 @@ from data_loader.stage1_norm import (
     normalize_mv,
     pad_crop_temporal,
     save_norm_stats,
+)
+from models.stage1_heads import STAGE1_HEAD_TYPES, build_stage1_head, head_config_from_args
+from models.stage1_losses import (
+    bincount_labels,
+    build_stage1_criterion,
+    criterion_forward,
 )
 
 
@@ -87,7 +94,26 @@ TRAINING_DEFAULTS: Dict[str, Any] = {
     "use_embedding_cache": True,
     "embedding_cache_dir": None,
     "recompute_embedding_cache": False,
-    "cache_test_embeddings": True,
+        "cache_test_embeddings": True,
+        # "memmap": stream cache to disk (low RAM); "ram" legacy: full tensor in .pt (OOM on large splits)
+        "embedding_cache_storage": "memmap",
+    # Classification head (encoder frozen)
+    "head_type": "mlp",
+    "encoder_num_variates": 12,
+    "head_hidden_dim": 256,
+    "head_num_layers": 2,
+    "head_dropout": 0.1,
+    "head_conv_channels": 256,
+    "head_conv_d_proj": 128,
+    "head_conv_kernel_size": 3,
+    "head_conv_num_layers": 2,
+    "head_lstm_hidden_dim": 256,
+    "head_lstm_num_layers": 1,
+    # Loss / class balance
+    "loss_type": "weighted_ce",
+    "class_weight_mode": "inverse_sqrt",
+    "focal_gamma": 2.0,
+    "class_balance_beta": 0.9999,
 }
 
 
@@ -258,9 +284,64 @@ def parse_args() -> argparse.Namespace:
         default=m["cache_test_embeddings"],
         help="Also cache test embeddings for faster final test evaluation",
     )
+    p.add_argument(
+        "--embedding-cache-storage",
+        type=str,
+        default=m["embedding_cache_storage"],
+        choices=("memmap", "ram"),
+        help="memmap: stream cache to disk (low RAM, fast training reads). "
+        "ram: legacy single .pt tensor (small splits only).",
+    )
+    p.add_argument(
+        "--head-type",
+        type=str,
+        default=m["head_type"],
+        choices=STAGE1_HEAD_TYPES,
+        help="Classifier on top of frozen encoder tokens (see models/stage1_heads.py)",
+    )
+    p.add_argument(
+        "--encoder-num-variates",
+        type=int,
+        default=m["encoder_num_variates"],
+        help="Chronos encoder variate count V (probe overrides; default 12 for 6+6 IMU)",
+    )
+    p.add_argument("--head-hidden-dim", type=int, default=m["head_hidden_dim"])
+    p.add_argument("--head-num-layers", type=int, default=m["head_num_layers"], help="MLP depth (hidden layers)")
+    p.add_argument("--head-dropout", type=float, default=m["head_dropout"])
+    p.add_argument("--head-conv-channels", type=int, default=m["head_conv_channels"])
+    p.add_argument("--head-conv-d-proj", type=int, default=m["head_conv_d_proj"])
+    p.add_argument("--head-conv-kernel-size", type=int, default=m["head_conv_kernel_size"])
+    p.add_argument("--head-conv-num-layers", type=int, default=m["head_conv_num_layers"])
+    p.add_argument("--head-lstm-hidden-dim", type=int, default=m["head_lstm_hidden_dim"])
+    p.add_argument("--head-lstm-num-layers", type=int, default=m["head_lstm_num_layers"])
+    p.add_argument(
+        "--loss-type",
+        type=str,
+        default=m["loss_type"],
+        choices=("ce", "weighted_ce", "focal", "weighted_focal"),
+        help="ce=unweighted softmax; weighted_ce/focal* use --class-weight-mode",
+    )
+    p.add_argument(
+        "--class-weight-mode",
+        type=str,
+        default=m["class_weight_mode"],
+        choices=("none", "inverse", "inverse_sqrt", "effective"),
+        help="Train-set frequency weights (effective = Class-Balanced beta)",
+    )
+    p.add_argument("--focal-gamma", type=float, default=m["focal_gamma"])
+    p.add_argument(
+        "--class-balance-beta",
+        type=float,
+        default=m["class_balance_beta"],
+        help="Beta for effective-number class weights (only if --class-weight-mode effective)",
+    )
     args = p.parse_args(rest)
     if args.early_stopping_metric not in ("val_loss", "val_top1"):
         raise ValueError(f"Invalid early_stopping_metric: {args.early_stopping_metric!r}")
+    if args.loss_type == "ce" and args.class_weight_mode != "none":
+        raise ValueError("loss_type=ce requires class_weight_mode=none (use weighted_ce or focal variants).")
+    if args.loss_type in ("weighted_ce", "weighted_focal") and args.class_weight_mode == "none":
+        raise ValueError(f"{args.loss_type} requires class_weight_mode != none")
     return args
 
 
@@ -335,6 +416,13 @@ def make_stage1_cfg(args: argparse.Namespace) -> Stage1ExportConfig:
     )
 
 
+def compute_train_label_counts(train_ds: Stage1IMUKeyDataset, num_classes: int) -> torch.Tensor:
+    """Per-class counts on the training split (from JSONL rows)."""
+    ids = [int(r["label_id"]) for r in train_ds._rows]
+    t = torch.tensor(ids, dtype=torch.long)
+    return bincount_labels(t, num_classes)
+
+
 def collate_chronos_batch(
     mean: np.ndarray,
     std: np.ndarray,
@@ -397,6 +485,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     context_length: int,
+    criterion: nn.Module,
 ) -> Dict[str, float]:
     head.eval()
     totals = {"n": 0, "loss": 0.0}
@@ -406,11 +495,9 @@ def evaluate(
         y = batch["label_id"].to(device)
         b = imu.shape[0]
         emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
-        h = pool_stacked_encoder_embeddings(stack_embeddings_from_embed_list(emb_list)).to(
-            device, dtype=torch.float32
-        )
-        logits = head(h)
-        loss = F.cross_entropy(logits, y)
+        stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+        logits = head(stacked)
+        loss = criterion_forward(criterion, logits, y)
         totals["loss"] += float(loss.item()) * b
         totals["n"] += b
         acc = topk_accuracy(logits, y, (1, 3, 5))
@@ -424,6 +511,41 @@ def evaluate(
         "top3": acc_sums["top3"] / n,
         "top5": acc_sums["top5"] / n,
     }
+
+
+class MemmapCachedEmbeddingDataset(Dataset):
+    """Disk-backed fp16 (V,L,D) encoder tokens + int64 labels; one row loaded per __getitem__."""
+
+    def __init__(
+        self,
+        feat_path: Path,
+        lab_path: Path,
+        num_samples: int,
+        shape_vld: Tuple[int, int, int],
+    ) -> None:
+        super().__init__()
+        self._n = int(num_samples)
+        v, l, d = shape_vld
+        self._feat = np.memmap(
+            feat_path,
+            dtype=np.float16,
+            mode="r",
+            shape=(self._n, v, l, d),
+        )
+        self._lab = np.memmap(
+            lab_path,
+            dtype=np.int64,
+            mode="r",
+            shape=(self._n,),
+        )
+
+    def __len__(self) -> int:
+        return self._n
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = torch.from_numpy(np.asarray(self._feat[idx])).float()
+        y = torch.tensor(int(self._lab[idx]), dtype=torch.long)
+        return x, y
 
 
 def _stable_json_hash(payload: Mapping[str, Any]) -> str:
@@ -455,6 +577,48 @@ def _cache_signature_payload(
 
 
 @torch.no_grad()
+def _try_load_legacy_pt_cache(
+    cache_path: Path,
+    logger: logging.Logger,
+    split_name: str,
+) -> Optional[TensorDataset]:
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    h = payload["features"]
+    y = payload["labels"]
+    fmt = payload.get("cache_format", "legacy_pooled")
+    ok = (
+        y.ndim == 1
+        and int(h.shape[0]) == int(y.shape[0])
+        and (
+            (fmt == "encoder_tokens_pre_pool" and h.ndim == 4)
+            or (fmt == "legacy_pooled" and h.ndim == 2)
+        )
+    )
+    if not ok:
+        return None
+    if h.ndim == 4:
+        _, v, l, d = h.shape
+        logger.info(
+            "Loaded RAM (.pt) embedding cache for %s: %s (n=%d, shape=V×L×D=%d×%d×%d, pre-pool)",
+            split_name,
+            cache_path,
+            h.shape[0],
+            v,
+            l,
+            d,
+        )
+    else:
+        logger.info(
+            "Loaded legacy pooled RAM cache for %s: %s (n=%d, d_model=%d)",
+            split_name,
+            cache_path,
+            h.shape[0],
+            h.shape[1],
+        )
+    return TensorDataset(h, y)
+
+
+@torch.no_grad()
 def _build_or_load_cached_embeddings(
     *,
     split_name: str,
@@ -468,56 +632,147 @@ def _build_or_load_cached_embeddings(
     args: argparse.Namespace,
     logger: logging.Logger,
     force_recompute: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Build or load cached encoder features. Returns (dataset, cache_meta) where dataset is
+    MemmapCachedEmbeddingDataset or TensorDataset, both compatible with DataLoader default collate.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = cache_dir / f"{split_name}_embeddings.pt"
+    storage = str(getattr(args, "embedding_cache_storage", "memmap"))
+    if storage not in ("memmap", "ram"):
+        raise ValueError(f"embedding_cache_storage must be memmap or ram, got {storage!r}")
+
+    legacy_pt_path = cache_dir / f"{split_name}_embeddings.pt"
+    feat_mm_path = cache_dir / f"{split_name}_embed_features.mmap"
+    lab_mm_path = cache_dir / f"{split_name}_embed_labels.mmap"
     meta_path = cache_dir / f"{split_name}_cache_meta.json"
 
     sig_payload = _cache_signature_payload(args=args, split_path=split_path, stats_path=stats_path, patch_info=patch_info)
     sig_hash = _stable_json_hash(sig_payload)
 
-    if (not force_recompute) and cache_path.is_file() and meta_path.is_file():
+    if (not force_recompute) and meta_path.is_file():
         try:
             cache_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             if cache_meta.get("signature_hash") == sig_hash:
-                payload = torch.load(cache_path, map_location="cpu", weights_only=False)
-                h = payload["features"]
-                y = payload["labels"]
-                fmt = payload.get("cache_format", "legacy_pooled")
-                ok = (
-                    y.ndim == 1
-                    and int(h.shape[0]) == int(y.shape[0])
-                    and (
-                        (fmt == "encoder_tokens_pre_pool" and h.ndim == 4)
-                        or (fmt == "legacy_pooled" and h.ndim == 2)
+                if feat_mm_path.is_file() and lab_mm_path.is_file():
+                    n = int(cache_meta["num_samples"])
+                    v_l_d = cache_meta.get("encoder_shape_V_L_D", cache_meta.get("encoder_shape_vld"))
+                    if not v_l_d or len(v_l_d) != 3:
+                        raise ValueError("cache meta missing encoder_shape_V_L_D")
+                    v, l, d_model = (int(x) for x in v_l_d)
+                    logger.info(
+                        "Loaded memmap embedding cache for %s: %s (%d samples, V×L×D=%d×%d×%d)",
+                        split_name,
+                        feat_mm_path,
+                        n,
+                        v,
+                        l,
+                        d_model,
                     )
-                )
-                if ok:
-                    if h.ndim == 4:
-                        _, v, l, d = h.shape
-                        logger.info(
-                            "Loaded embedding cache for %s: %s (n=%d, shape=V×L×D=%d×%d×%d, pre-pool)",
-                            split_name,
-                            cache_path,
-                            h.shape[0],
-                            v,
-                            l,
-                            d,
-                        )
-                    else:
-                        logger.info(
-                            "Loaded legacy pooled embedding cache for %s: %s (n=%d, d_model=%d)",
-                            split_name,
-                            cache_path,
-                            h.shape[0],
-                            h.shape[1],
-                        )
-                    return h, y, cache_meta
+                    ds = MemmapCachedEmbeddingDataset(
+                        feat_mm_path, lab_mm_path, n, (v, l, d_model)
+                    )
+                    return ds, cache_meta
+                if legacy_pt_path.is_file() and storage == "ram":
+                    loaded = _try_load_legacy_pt_cache(legacy_pt_path, logger, split_name)
+                    if loaded is not None:
+                        return loaded, cache_meta
+                if legacy_pt_path.is_file() and storage == "memmap":
+                    logger.warning(
+                        "Only legacy RAM cache %s exists; rebuilding on-disk memmap (one-time embed pass). "
+                        "Remove the .pt file and use --recompute-embedding-cache to force.",
+                        legacy_pt_path.name,
+                    )
         except Exception as e:  # pragma: no cover
             logger.warning("Could not load existing embedding cache for %s (%s); rebuilding", split_name, e)
 
-    logger.info("Building embedding cache for %s (pre-pool encoder tokens) …", split_name)
+    # Rebuild: remove stale files for this split so we do not mix formats
+    for p in (feat_mm_path, lab_mm_path, legacy_pt_path):
+        if p.is_file():
+            p.unlink()
+
+    logger.info(
+        "Building embedding cache for %s (pre-pool encoder tokens, storage=%s) …",
+        split_name,
+        storage,
+    )
     t0 = time.perf_counter()
+    n_total = len(raw_loader.dataset)
+    if n_total == 0:
+        raise RuntimeError(f"Cannot build embedding cache for {split_name}: split has zero samples.")
+
+    if storage == "memmap":
+        offset = 0
+        mm_f: Optional[np.memmap] = None
+        mm_y: Optional[np.memmap] = None
+        v_ld: Optional[Tuple[int, int, int]] = None
+        for batch in raw_loader:
+            imu = batch["imu_mv"].float()
+            y = batch["label_id"].to(torch.long).cpu()
+            b = int(imu.shape[0])
+            emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
+            stacked = stack_embeddings_from_embed_list(emb_list).to(dtype=torch.float32, device="cpu")
+            if mm_f is None:
+                v1, l1, d1 = (int(stacked.shape[i]) for i in (1, 2, 3))
+                v_ld = (v1, l1, d1)
+                mm_f = np.memmap(
+                    feat_mm_path,
+                    dtype=np.float16,
+                    mode="w+",
+                    shape=(n_total, v1, l1, d1),
+                )
+                mm_y = np.memmap(
+                    lab_mm_path,
+                    dtype=np.int64,
+                    mode="w+",
+                    shape=(n_total,),
+                )
+            assert mm_y is not None and v_ld is not None
+            mm_f[offset : offset + b] = stacked.numpy().astype(np.float16)
+            mm_y[offset : offset + b] = y.numpy().astype(np.int64)
+            offset += b
+        if offset != n_total:
+            raise RuntimeError(
+                f"Embedding cache row count mismatch for {split_name}: wrote {offset}, expected {n_total}"
+            )
+        if mm_f is not None:
+            mm_f.flush()
+        if mm_y is not None:
+            mm_y.flush()
+        del mm_f, mm_y
+
+        v, l, d_model = v_ld  # type: ignore[misc]
+        nbytes = int(n_total * v * l * d_model * 2)
+        cache_meta = {
+            "split": split_name,
+            "storage": "memmap",
+            "features_path": feat_mm_path.name,
+            "labels_path": lab_mm_path.name,
+            "created_at": datetime.now().isoformat(),
+            "signature_hash": sig_hash,
+            "signature_payload": sig_payload,
+            "num_samples": n_total,
+            "encoder_shape_V_L_D": [v, l, d_model],
+            "d_model": d_model,
+            "cache_format": "encoder_tokens_pre_pool",
+            "approx_bytes_on_disk": nbytes + n_total * 8,
+        }
+        meta_path.write_text(json.dumps(cache_meta, indent=2, default=str), encoding="utf-8")
+        logger.info(
+            "Saved memmap embedding cache for %s: %s (n=%d, V×L×D=%d×%d×%d, fp16 disk ~%.1f MiB, %.1fs)",
+            split_name,
+            feat_mm_path,
+            n_total,
+            v,
+            l,
+            d_model,
+            nbytes / (1024**2),
+            time.perf_counter() - t0,
+        )
+        ds = MemmapCachedEmbeddingDataset(feat_mm_path, lab_mm_path, n_total, (v, l, d_model))
+        return ds, cache_meta
+
+    # storage == "ram": legacy in-memory concat + single .pt
     h_chunks: List[torch.Tensor] = []
     y_chunks: List[torch.Tensor] = []
     for batch in raw_loader:
@@ -528,8 +783,6 @@ def _build_or_load_cached_embeddings(
         stacked = stack_embeddings_from_embed_list(emb_list).to(dtype=torch.float32, device="cpu")
         h_chunks.append(stacked)
         y_chunks.append(y)
-    if not h_chunks:
-        raise RuntimeError(f"Cannot build embedding cache for {split_name}: split has zero samples.")
 
     h_all = torch.cat(h_chunks, dim=0).contiguous()
     y_all = torch.cat(y_chunks, dim=0).contiguous()
@@ -545,12 +798,13 @@ def _build_or_load_cached_embeddings(
             "cache_format": "encoder_tokens_pre_pool",
             "cache_storage_dtype": "float16",
         },
-        cache_path,
+        legacy_pt_path,
     )
     v, l, d_model = int(h_all.shape[1]), int(h_all.shape[2]), int(h_all.shape[3])
     cache_meta = {
         "split": split_name,
-        "cache_path": str(cache_path.resolve()),
+        "storage": "ram",
+        "cache_path": str(legacy_pt_path.resolve()),
         "created_at": datetime.now().isoformat(),
         "signature_hash": sig_hash,
         "signature_payload": sig_payload,
@@ -562,9 +816,9 @@ def _build_or_load_cached_embeddings(
     }
     meta_path.write_text(json.dumps(cache_meta, indent=2, default=str), encoding="utf-8")
     logger.info(
-        "Saved embedding cache for %s: %s (n=%d, V×L×D=%d×%d×%d, fp16 disk ~%.1f MiB, %.1fs)",
+        "Saved RAM (.pt) embedding cache for %s: %s (n=%d, V×L×D=%d×%d×%d, fp16 disk ~%.1f MiB, %.1fs)",
         split_name,
-        cache_path,
+        legacy_pt_path,
         h_all.shape[0],
         v,
         l,
@@ -572,7 +826,7 @@ def _build_or_load_cached_embeddings(
         nbytes / (1024**2),
         time.perf_counter() - t0,
     )
-    return h_all, y_all, cache_meta
+    return TensorDataset(h_all, y_all), cache_meta
 
 
 @torch.no_grad()
@@ -580,6 +834,7 @@ def evaluate_cached(
     head: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    criterion: nn.Module,
 ) -> Dict[str, float]:
     head.eval()
     totals = {"n": 0, "loss": 0.0}
@@ -589,15 +844,14 @@ def evaluate_cached(
         if emb.dtype == torch.float16:
             emb = emb.float()
         if emb.ndim == 4:
-            h = pool_stacked_encoder_embeddings(emb)
+            logits = head(emb)
         elif emb.ndim == 2:
-            h = emb
+            logits = head(emb)
         else:
             raise ValueError(f"Unexpected cached feature shape {tuple(emb.shape)}")
         y = y_cpu.to(device=device, non_blocking=True)
-        b = int(h.shape[0])
-        logits = head(h)
-        loss = F.cross_entropy(logits, y)
+        b = int(logits.shape[0])
+        loss = criterion_forward(criterion, logits, y)
         totals["loss"] += float(loss.item()) * b
         totals["n"] += b
         acc = topk_accuracy(logits, y, (1, 3, 5))
@@ -623,13 +877,20 @@ def _build_head_ckpt(
     num_classes: int,
     context_length: int,
     chronos_model: str,
+    args: argparse.Namespace,
+    loss_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
+    hc = head_config_from_args(args)
+    hc["d_model"] = d_model
+    hc["num_classes"] = num_classes
     return {
         "head_state_dict": head.state_dict(),
+        "head_config": hc,
         "d_model": d_model,
         "num_classes": num_classes,
         "context_length": context_length,
         "chronos_model": chronos_model,
+        "loss_config": loss_meta,
     }
 
 
@@ -774,22 +1035,61 @@ def main() -> None:
     with torch.no_grad():
         emb0, _ = pipeline.embed(imu0, batch_size=b0, context_length=args.context_length)
     d_model = int(emb0[0].shape[-1])
+    args.encoder_num_variates = int(emb0[0].shape[0])
     logger.info(
-        "Embed probe: first series emb shape=%s, d_model=%d, num_classes=%d",
+        "Embed probe: first series emb shape=%s, d_model=%d, V=%d, num_classes=%d",
         tuple(emb0[0].shape),
         d_model,
+        args.encoder_num_variates,
         num_classes,
     )
 
-    head = nn.Linear(d_model, num_classes).to(device)
+    class_counts = compute_train_label_counts(train_ds, num_classes)
+    criterion, loss_meta = build_stage1_criterion(
+        loss_type=args.loss_type,
+        num_classes=num_classes,
+        class_counts=class_counts,
+        class_weight_mode=args.class_weight_mode,
+        focal_gamma=args.focal_gamma,
+        class_balance_beta=args.class_balance_beta,
+        device=device,
+    )
+    logger.info(
+        "Classifier head: type=%s hidden=%d dropout=%s | loss=%s class_weight_mode=%s",
+        args.head_type,
+        args.head_hidden_dim,
+        args.head_dropout,
+        args.loss_type,
+        args.class_weight_mode,
+    )
+
+    head = build_stage1_head(
+        args.head_type,
+        d_model,
+        num_classes,
+        num_variates=args.encoder_num_variates,
+        hidden_dim=args.head_hidden_dim,
+        head_num_layers=args.head_num_layers,
+        dropout=args.head_dropout,
+        conv_channels=args.head_conv_channels,
+        conv_d_proj=args.head_conv_d_proj,
+        conv_kernel_size=args.head_conv_kernel_size,
+        conv_num_layers=args.head_conv_num_layers,
+        lstm_hidden_dim=args.head_lstm_hidden_dim,
+        lstm_num_layers=args.head_lstm_num_layers,
+    ).to(device)
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     cache_enabled = bool(args.freeze_encoder and args.use_embedding_cache)
     cache_dir = Path(args.embedding_cache_dir) if args.embedding_cache_dir else (out_dir / "embedding_cache")
     cache_meta_by_split: Dict[str, Any] = {}
     if cache_enabled:
-        logger.info("Embedding cache mode enabled (freeze_encoder=%s).", args.freeze_encoder)
-        train_h, train_y, train_cache_meta = _build_or_load_cached_embeddings(
+        logger.info(
+            "Embedding cache mode enabled (freeze_encoder=%s, storage=%s).",
+            args.freeze_encoder,
+            getattr(args, "embedding_cache_storage", "memmap"),
+        )
+        train_ds_cached, train_cache_meta = _build_or_load_cached_embeddings(
             split_name="train",
             split_path=export_dir / "train.jsonl",
             raw_loader=train_loader_raw,
@@ -802,7 +1102,7 @@ def main() -> None:
             logger=logger,
             force_recompute=bool(args.recompute_embedding_cache),
         )
-        val_h, val_y, val_cache_meta = _build_or_load_cached_embeddings(
+        val_ds_cached, val_cache_meta = _build_or_load_cached_embeddings(
             split_name="val",
             split_path=export_dir / "val.jsonl",
             raw_loader=val_loader_raw,
@@ -817,8 +1117,9 @@ def main() -> None:
         )
         cache_meta_by_split["train"] = train_cache_meta
         cache_meta_by_split["val"] = val_cache_meta
+        test_ds_cached: Optional[Dataset] = None
         if args.cache_test_embeddings:
-            test_h, test_y, test_cache_meta = _build_or_load_cached_embeddings(
+            test_ds_cached, test_cache_meta = _build_or_load_cached_embeddings(
                 split_name="test",
                 split_path=export_dir / "test.jsonl",
                 raw_loader=test_loader_raw,
@@ -832,11 +1133,9 @@ def main() -> None:
                 force_recompute=bool(args.recompute_embedding_cache),
             )
             cache_meta_by_split["test"] = test_cache_meta
-        else:
-            test_h, test_y = None, None
 
         train_loader = DataLoader(
-            TensorDataset(train_h, train_y),
+            train_ds_cached,
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=0,
@@ -844,16 +1143,16 @@ def main() -> None:
             drop_last=False,
         )
         val_loader = DataLoader(
-            TensorDataset(val_h, val_y),
+            val_ds_cached,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=0,
             pin_memory=device.type == "cuda",
         )
         test_loader = None
-        if test_h is not None and test_y is not None:
+        if test_ds_cached is not None:
             test_loader = DataLoader(
-                TensorDataset(test_h, test_y),
+                test_ds_cached,
                 batch_size=args.batch_size,
                 shuffle=False,
                 num_workers=0,
@@ -880,12 +1179,15 @@ def main() -> None:
         "context_length": args.context_length,
         "num_classes": num_classes,
         "d_model": d_model,
+        "encoder_num_variates": int(args.encoder_num_variates),
         "device": str(device),
         "target_rate_hz": args.target_rate_hz,
         "chronos_patch_info": patch_info,
         "log_file": str(log_path.resolve()),
         "config_file": str(Path(args.config).resolve()) if args.config else None,
         "training_config": resolved_training_config(args),
+        "head_config": head_config_from_args(args),
+        "loss_config": loss_meta,
         "freeze_encoder": bool(args.freeze_encoder),
         "embedding_cache_enabled": bool(cache_enabled),
         "embedding_cache_dir": str(cache_dir.resolve()) if cache_enabled else None,
@@ -914,17 +1216,13 @@ def main() -> None:
                 emb = emb_cpu.to(device=device, non_blocking=True)
                 if emb.dtype == torch.float16:
                     emb = emb.float()
-                if emb.ndim == 4:
-                    h = pool_stacked_encoder_embeddings(emb)
-                elif emb.ndim == 2:
-                    h = emb
-                else:
+                if emb.ndim not in (2, 4):
                     raise ValueError(f"Unexpected cached feature shape {tuple(emb.shape)}")
                 y = y_cpu.to(device=device, non_blocking=True)
-                b = int(h.shape[0])
+                b = int(emb.shape[0])
                 opt.zero_grad(set_to_none=True)
-                logits = head(h)
-                loss = F.cross_entropy(logits, y)
+                logits = head(emb)
+                loss = criterion_forward(criterion, logits, y)
                 loss.backward()
                 opt.step()
                 running += float(loss.item()) * b
@@ -937,20 +1235,18 @@ def main() -> None:
                 opt.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=args.context_length)
-                h = pool_stacked_encoder_embeddings(stack_embeddings_from_embed_list(emb_list)).to(
-                    device, dtype=torch.float32
-                )
-                logits = head(h)
-                loss = F.cross_entropy(logits, y)
+                stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+                logits = head(stacked)
+                loss = criterion_forward(criterion, logits, y)
                 loss.backward()
                 opt.step()
                 running += float(loss.item()) * b
                 n_seen += b
         train_loss = running / max(n_seen, 1)
         if cache_enabled:
-            val_m = evaluate_cached(head, val_loader, device)
+            val_m = evaluate_cached(head, val_loader, device, criterion)
         else:
-            val_m = evaluate(pipeline, head, val_loader, device, args.context_length)
+            val_m = evaluate(pipeline, head, val_loader, device, args.context_length, criterion)
         if device.type == "cuda":
             mem_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
             logger.info("epoch %d/%d  train_loss=%.4f  val_loss=%.4f  val top1/3/5=%.4f/%.4f/%.4f  (%ds)  cuda_mem_peak=%.0fMiB",
@@ -992,7 +1288,9 @@ def main() -> None:
                 "val_top5": val_m["top5"],
             }
             best_state_cpu = _clone_state_dict_cpu(head)
-            ckpt_best = _build_head_ckpt(head, d_model, num_classes, args.context_length, args.chronos_model)
+            ckpt_best = _build_head_ckpt(
+                head, d_model, num_classes, args.context_length, args.chronos_model, args, loss_meta
+            )
             torch.save(ckpt_best, head_best_path)
             logger.info(
                 "  new best (%s=%.6f at epoch %d) → saved %s",
@@ -1020,9 +1318,9 @@ def main() -> None:
     head.load_state_dict({k: v.to(device) for k, v in best_state_cpu.items()})
 
     if cache_enabled and test_loader is not None:
-        test_m = evaluate_cached(head, test_loader, device)
+        test_m = evaluate_cached(head, test_loader, device, criterion)
     else:
-        test_m = evaluate(pipeline, head, test_loader_raw, device, args.context_length)
+        test_m = evaluate(pipeline, head, test_loader_raw, device, args.context_length, criterion)
     logger.info(
         "test  loss=%.4f  top1/3/5=%.4f/%.4f/%.4f",
         test_m["loss"],
@@ -1031,7 +1329,7 @@ def main() -> None:
         test_m["top5"],
     )
 
-    ckpt = _build_head_ckpt(head, d_model, num_classes, args.context_length, args.chronos_model)
+    ckpt = _build_head_ckpt(head, d_model, num_classes, args.context_length, args.chronos_model, args, loss_meta)
     head_path = out_dir / "head.pt"
     torch.save(ckpt, head_path)
     logger.info("Wrote best checkpoint to %s (best epoch %d by %s)", head_path, best_epoch, args.early_stopping_metric)

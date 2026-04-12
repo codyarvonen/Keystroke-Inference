@@ -61,7 +61,15 @@ class Stage1ExportConfig:
     test_sessions: Sequence[str] = field(default_factory=tuple)
     val_sessions: Sequence[str] = field(default_factory=tuple)
     val_ratio: float = 0.2
+    # If set (session_random only): fraction of *pool* sessions (excluding train_only) for test.
+    # If None, legacy rule: n_test = max(1, n_val) with n_val from val_ratio only.
+    test_ratio: Optional[float] = None
     split_seed: int = 42
+    # session_random: assign val/test sessions to balance approximate row counts (extra pass over data).
+    balance_val_test_by_session_rows: bool = False
+
+    # Sessions forced to train only (never val/test). Use canonical keys, e.g. "003_014".
+    train_only_sessions: Sequence[str] = field(default_factory=tuple)
 
     # Optional session filters for experiments
     include_sessions: Optional[Sequence[str]] = None

@@ -1,4 +1,4 @@
-# Stage-1 Chronos + linear head — default training settings.
+# Stage-1 Chronos + classification head — default training settings.
 # Copy this file (e.g. configs/my_run.yaml), edit, and run:
 #   python train_stage1_chronos.py --config configs/my_run.yaml
 # CLI flags override values from the file.
@@ -21,6 +21,18 @@ model:
   recompute_embedding_cache: false
   cache_test_embeddings: true
   context_length: 256
+  # Head: linear | mlp | attention_pool | conv1d | lstm (see models/stage1_heads.py)
+  head_type: mlp
+  encoder_num_variates: 12
+  head_hidden_dim: 256
+  head_num_layers: 2
+  head_dropout: 0.1
+  head_conv_channels: 256
+  head_conv_d_proj: 128
+  head_conv_kernel_size: 3
+  head_conv_num_layers: 2
+  head_lstm_hidden_dim: 256
+  head_lstm_num_layers: 1
 
 window:
   left_ms: 700
@@ -34,6 +46,11 @@ training:
   weight_decay: 0.01
   num_workers: 4
   seed: 42
+  # Loss: ce | weighted_ce | focal | weighted_focal
+  loss_type: weighted_ce
+  class_weight_mode: inverse_sqrt  # none | inverse | inverse_sqrt | effective
+  focal_gamma: 2.0
+  class_balance_beta: 0.9999  # for effective-number weights only
 
 early_stopping:
   patience: 5  # 0 = run all epochs; set e.g. 5 to stop when val plateaus

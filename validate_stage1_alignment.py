@@ -53,8 +53,27 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help='Used with session_holdout, e.g. --val-sessions 003_007',
     )
+    parser.add_argument(
+        "--train-only-sessions",
+        nargs="*",
+        default=[],
+        metavar="SESSION_KEY",
+        help="Sessions forced to train only (ignored when using --export-dir; manifest wins)",
+    )
     parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=None,
+        metavar="F",
+        help="session_random only; omit to match legacy export behavior",
+    )
     parser.add_argument("--split-seed", type=int, default=42)
+    parser.add_argument(
+        "--balance-val-test-by-session-rows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--merge-letter-case",
         action=argparse.BooleanOptionalAction,
@@ -82,7 +101,10 @@ def main() -> None:
         cfg = stage1_export_config_from_manifest(manifest, data_dir=args.data_dir)
         print(
             f"Config from manifest: {manifest_path.resolve()} "
-            f"(merge_letter_case={cfg.merge_letter_case}, coarse_labels={cfg.coarse_labels})"
+            f"(merge_letter_case={cfg.merge_letter_case}, coarse_labels={cfg.coarse_labels}, "
+            f"train_only_sessions={list(cfg.train_only_sessions)}, "
+            f"test_ratio={cfg.test_ratio}, balance_val_test_by_session_rows="
+            f"{cfg.balance_val_test_by_session_rows})"
         )
     else:
         cfg = Stage1ExportConfig(
@@ -93,8 +115,11 @@ def main() -> None:
             session_split_strategy=args.session_split_strategy,  # type: ignore[arg-type]
             test_sessions=args.test_sessions,
             val_sessions=args.val_sessions,
+            train_only_sessions=tuple(args.train_only_sessions),
             val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
             split_seed=args.split_seed,
+            balance_val_test_by_session_rows=args.balance_val_test_by_session_rows,
             merge_letter_case=args.merge_letter_case,
             coarse_labels=args.coarse_labels,
         )

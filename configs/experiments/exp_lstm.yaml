@@ -1,0 +1,54 @@
+# BiLSTM head; coarse 32-class JSONL. Weighted CE (inverse_sqrt), same recipe as defaults except head.
+# Run: python train_stage1_chronos.py --config configs/experiments/exp_lstm.yaml
+
+paths:
+  export_dir: stage1_export_coarse32
+  data_dir: data
+  out_dir: checkpoints/exp_stage1_lstm
+  log_file: null
+
+model:
+  chronos_model: autogluon/chronos-2-small
+  device: cuda:1
+  freeze_encoder: true
+  use_embedding_cache: true
+  embedding_cache_dir: null
+  recompute_embedding_cache: false
+  cache_test_embeddings: true
+  context_length: 256
+  head_type: lstm
+  encoder_num_variates: 12
+  head_hidden_dim: 256
+  head_num_layers: 2
+  head_dropout: 0.1
+  head_conv_channels: 256
+  head_conv_d_proj: 128
+  head_conv_kernel_size: 3
+  head_conv_num_layers: 2
+  head_lstm_hidden_dim: 256
+  head_lstm_num_layers: 1
+
+window:
+  left_ms: 700
+  right_ms: 150
+  target_rate_hz: 100.0
+
+training:
+  epochs: 100
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 0.01
+  num_workers: 4
+  seed: 42
+  loss_type: weighted_ce
+  class_weight_mode: inverse_sqrt
+  focal_gamma: 2.0
+  class_balance_beta: 0.9999
+
+early_stopping:
+  patience: 5
+  min_delta: 0.0
+  early_stopping_metric: val_loss
+
+norm:
+  recompute_norm: false

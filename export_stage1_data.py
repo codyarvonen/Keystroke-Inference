@@ -30,8 +30,30 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--test-sessions", nargs="*", default=[])
     p.add_argument("--val-sessions", nargs="*", default=[])
+    p.add_argument(
+        "--train-only-sessions",
+        nargs="*",
+        default=[],
+        metavar="SESSION_KEY",
+        help='Sessions forced to train only (never val/test), e.g. 003_014 003_015 (must match filename-derived keys)',
+    )
     p.add_argument("--val-ratio", type=float, default=0.2)
+    p.add_argument(
+        "--test-ratio",
+        type=float,
+        default=None,
+        metavar="F",
+        help="session_random: fraction of pool sessions (after train_only) for test. "
+        "If omitted, legacy rule: n_test = max(1, n_val) from --val-ratio only.",
+    )
     p.add_argument("--split-seed", type=int, default=42)
+    p.add_argument(
+        "--balance-val-test-by-session-rows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="session_random: assign val/test sessions to balance approximate row counts "
+        "(extra pass over raw sessions; no leakage)",
+    )
     p.add_argument(
         "--merge-letter-case",
         action=argparse.BooleanOptionalAction,
@@ -57,8 +79,11 @@ def main() -> None:
         session_split_strategy=args.session_split_strategy,  # type: ignore[arg-type]
         test_sessions=args.test_sessions,
         val_sessions=args.val_sessions,
+        train_only_sessions=tuple(args.train_only_sessions),
         val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
         split_seed=args.split_seed,
+        balance_val_test_by_session_rows=args.balance_val_test_by_session_rows,
         merge_letter_case=args.merge_letter_case,
         coarse_labels=args.coarse_labels,
     )
@@ -69,6 +94,15 @@ def main() -> None:
     print(f"  vocab_size: {manifest['vocab_size']}")
     print(f"  rows_written: {manifest['rows_written']}")
     print(f"  unk_label_count_by_split: {manifest['unk_label_count_by_split']}")
+
+    sbs = manifest.get("build_stats", {}).get("sessions_by_split")
+    if isinstance(sbs, dict):
+        print("  sessions_by_split (session_key → split assignment):")
+        for split_name in ("train", "val", "test"):
+            sessions = sbs.get(split_name) or []
+            n = len(sessions)
+            joined = ", ".join(sessions)
+            print(f"    {split_name} ({n}): {joined}")
 
     vocab_path = out_dir / "vocab.json"
     v = json.loads(vocab_path.read_text(encoding="utf-8"))

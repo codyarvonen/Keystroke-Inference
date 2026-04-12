@@ -2,16 +2,13 @@
 """
 Evaluate a trained Stage-1 Chronos head on a split and export confusion/F1 artifacts.
 
-Default behavior matches the training setup saved in:
-  - checkpoints/stage1_chronos/head.pt
-  - checkpoints/stage1_chronos/train_meta.json
-  - checkpoints/stage1_chronos/norm_stats.json
+Point --head-ckpt / --meta-path / --norm-stats at your run (defaults still point at example paths under checkpoints/stage1_chronos/).
 
-Outputs:
-  - <out-dir>/metrics.json
-  - <out-dir>/confusion_matrix.npy
-  - <out-dir>/confusion_matrix.csv
-  - <out-dir>/per_class_f1.csv
+Outputs (default --out-dir: <parent-of-head-ckpt>/eval_<split>/):
+  - metrics.json
+  - confusion_matrix.npy
+  - confusion_matrix.csv
+  - per_class_f1.csv
 """
 
 from __future__ import annotations
@@ -26,6 +23,7 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from data_loader.config import Stage1ExportConfig
@@ -37,9 +35,9 @@ from data_loader.stage1_norm import (
     normalize_mv,
     pad_crop_temporal,
 )
+from models.stage1_heads import load_stage1_head_from_checkpoint
 from train_stage1_chronos import (
     _require_chronos,
-    pool_stacked_encoder_embeddings,
     stack_embeddings_from_embed_list,
     topk_accuracy,
 )
@@ -58,7 +56,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--context-length", type=int, default=None, help="Override context length (default from train_meta)")
     p.add_argument("--chronos-model", type=str, default=None, help="Override Chronos model (default from train_meta)")
-    p.add_argument("--out-dir", type=str, default="checkpoints/stage1_chronos/eval_test")
+    p.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="Where to write metrics/CSVs (default: <head-ckpt parent>/eval_<split>/)",
+    )
     p.add_argument("--topk-per-class", type=int, default=20, help="How many classes to print by support/F1")
     p.add_argument(
         "--show-random-sequence",
@@ -84,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         help="Optional RNG seed for reproducible random sequence sampling",
     )
     return p.parse_args()
+
+
+def default_eval_out_dir(head_ckpt: Path, split: str) -> Path:
+    """Keep eval artifacts next to the checkpoint run, not a global shared folder."""
+    return head_ckpt.resolve().parent / f"eval_{split}"
 
 
 def _build_stage1_cfg(manifest: Dict[str, Any], data_dir_override: str | None) -> Stage1ExportConfig:
@@ -159,10 +167,8 @@ def _print_random_sequence_predictions(
 
     with torch.no_grad():
         emb_list, _ = pipeline.embed(x.float(), batch_size=bsz, context_length=context_length)
-        h = pool_stacked_encoder_embeddings(stack_embeddings_from_embed_list(emb_list)).to(
-            device, dtype=torch.float32
-        )
-        logits = head(h)
+        stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+        logits = head(stacked)
         probs = torch.softmax(logits, dim=1)
         top_p, top_i = probs.topk(k=min(5, probs.shape[1]), dim=1)
 
@@ -199,6 +205,8 @@ def main() -> None:
         raise FileNotFoundError(f"Missing train meta: {meta_path}")
     if not norm_stats_path.is_file():
         raise FileNotFoundError(f"Missing norm stats: {norm_stats_path}")
+
+    out_dir = Path(args.out_dir) if args.out_dir else default_eval_out_dir(head_ckpt_path, args.split)
 
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     export_dir = Path(args.export_dir or meta["export_dir"])
@@ -248,8 +256,7 @@ def main() -> None:
             f"Class mismatch: checkpoint has {ckpt_num_classes}, vocab has {num_classes}. "
             "Use matching export/vocab/checkpoint artifacts."
         )
-    head = nn.Linear(d_model, num_classes).to(device)
-    head.load_state_dict(ckpt["head_state_dict"])
+    head = load_stage1_head_from_checkpoint(ckpt, d_model=d_model, num_classes=num_classes, device=device)
     head.eval()
 
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
@@ -262,11 +269,9 @@ def main() -> None:
             bsz = int(imu.shape[0])
 
             emb_list, _ = pipeline.embed(imu, batch_size=bsz, context_length=context_length)
-            h = pool_stacked_encoder_embeddings(stack_embeddings_from_embed_list(emb_list)).to(
-                device, dtype=torch.float32
-            )
-            logits = head(h)
-            loss = torch.nn.functional.cross_entropy(logits, y)
+            stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+            logits = head(stacked)
+            loss = F.cross_entropy(logits, y)
 
             acc = topk_accuracy(logits, y, (1, 3, 5))
             pred = logits.argmax(dim=1)
@@ -307,7 +312,6 @@ def main() -> None:
     weighted_f1 = float((f1 * support).sum() / max(support.sum(), 1.0))
     micro_f1 = float(tp_sum / max(cm.sum(), 1))
 
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     np.save(out_dir / "confusion_matrix.npy", cm)
@@ -352,10 +356,12 @@ def main() -> None:
         "chronos_model": chronos_model,
         "context_length": context_length,
         "device": str(device),
+        "out_dir": str(out_dir.resolve()),
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
     print("\n=== Stage-1 Evaluation ===")
+    print(f"out_dir:      {out_dir.resolve()}")
     print(f"split:        {args.split}")
     print(f"samples:      {int(cm.sum())}")
     print(f"loss:         {loss:.6f}")
