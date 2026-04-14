@@ -9,7 +9,7 @@ All heads accept either:
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,6 +22,93 @@ STAGE1_HEAD_TYPES: Tuple[str, ...] = (
     "conv1d",
     "lstm",
 )
+
+
+def trim_encoder_time_tokens(
+    z: torch.Tensor,
+    *,
+    enabled: bool,
+    drop_last: int,
+) -> torch.Tensor:
+    """Backward-compatible alias: ``drop_last`` trailing positions only (no window trim)."""
+    return trim_encoder_outputs(
+        z,
+        enabled=enabled,
+        context_length=0,
+        input_patch_size=1,
+        lengths=None,
+        drop_last_specials=int(drop_last),
+        leading_trim=False,
+    )
+
+
+def trim_encoder_outputs(
+    z: torch.Tensor,
+    *,
+    enabled: bool,
+    context_length: int,
+    input_patch_size: int,
+    lengths: Optional[torch.Tensor],
+    drop_last_specials: int = 2,
+    leading_trim: bool = True,
+) -> torch.Tensor:
+    """
+    Prepare ``(B, V, L, D)`` encoder tokens for the head.
+
+    When ``enabled`` and ``leading_trim``:
+      Uses per-sample **raw window lengths** (timesteps before ``pad_crop_temporal``) to drop
+      leading **time** patch slots that only cover left NaN padding, then drops trailing specials.
+
+    Always (when ``enabled``): removes the last ``drop_last_specials`` positions along ``L``
+    (Chronos-2 ``embed``: ``[REG]`` + masked output-patch token after patch tokens).
+
+    If ``lengths`` is None, only the trailing specials are removed (no leading trim).
+
+    Per-sample trimmed lengths differ → tensors are **right-padded** along ``L`` to a common
+    length for batched convs. Legacy ``(B, D)`` inputs are unchanged.
+    """
+    if not enabled:
+        return z
+    if z.dim() != 4:
+        return z
+    b, v, l_enc, d_model = z.shape
+    drop = max(0, int(drop_last_specials))
+    if drop >= l_enc:
+        raise ValueError(
+            f"drop_last_specials ({drop}) must be < L ({l_enc}) for tensor shape (B, V, L, D)"
+        )
+    num_time_tokens = l_enc - drop
+    if num_time_tokens <= 0:
+        raise ValueError(f"no time patch tokens left after drop_last_specials={drop} (L={l_enc})")
+
+    p_sz = max(1, int(input_patch_size))
+    ctx = int(context_length)
+
+    pieces: List[torch.Tensor] = []
+    for i in range(b):
+        if lengths is not None and leading_trim:
+            t_raw = int(lengths[i].item())
+            if t_raw < 0:
+                p_first = 0
+            else:
+                t_c = min(t_raw, ctx) if ctx > 0 else t_raw
+                start_idx = 0 if t_raw >= ctx else max(0, ctx - t_c)
+                p_first = start_idx // p_sz
+        else:
+            p_first = 0
+        p_first = min(max(0, p_first), max(0, num_time_tokens - 1))
+        sl = z[i : i + 1, :, p_first:num_time_tokens, :]
+        pieces.append(sl)
+
+    max_len = max(int(x.shape[2]) for x in pieces)
+    out_list: List[torch.Tensor] = []
+    for sl in pieces:
+        li = int(sl.shape[2])
+        if li < max_len:
+            pad = sl.new_zeros(1, v, max_len - li, d_model)
+            sl = torch.cat([sl, pad], dim=2)
+        out_list.append(sl)
+    return torch.cat(out_list, dim=0)
 
 
 def _pool_mean_tokens(z: torch.Tensor) -> torch.Tensor:
@@ -279,6 +366,9 @@ def head_config_from_args(ns: Any) -> Dict[str, Any]:
         "conv_num_layers": getattr(ns, "head_conv_num_layers", 2),
         "lstm_hidden_dim": getattr(ns, "head_lstm_hidden_dim", 256),
         "lstm_num_layers": getattr(ns, "head_lstm_num_layers", 1),
+        "encoder_output_trim": bool(getattr(ns, "encoder_output_trim", False)),
+        "chronos_input_patch_size": getattr(ns, "chronos_input_patch_size", None),
+        "encoder_output_drop_last_specials": int(getattr(ns, "encoder_output_drop_last_specials", 2)),
     }
 
 

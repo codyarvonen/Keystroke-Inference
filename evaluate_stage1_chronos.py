@@ -35,9 +35,11 @@ from data_loader.stage1_norm import (
     normalize_mv,
     pad_crop_temporal,
 )
+from models.chronos_finetune import chronos_encode_multivariate_grad, set_encoder_finetune_train_mode
 from models.stage1_heads import load_stage1_head_from_checkpoint
 from train_stage1_chronos import (
     _require_chronos,
+    apply_stage1_encoder_trim,
     stack_embeddings_from_embed_list,
     topk_accuracy,
 )
@@ -102,8 +104,9 @@ def _collate_for_chronos(mean: np.ndarray, std: np.ndarray, context_length: int)
     def _fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         base = collate_stack_lr_pad_batch(batch)
         x = normalize_mv(base["imu_mv"], mean, std)
+        lengths = base["lengths"].clone()
         x = pad_crop_temporal(x, context_length)
-        return {"imu_mv": x, "label_id": base["label_id"]}
+        return {"imu_mv": x, "label_id": base["label_id"], "lengths": lengths}
 
     return _fn
 
@@ -143,6 +146,11 @@ def _print_random_sequence_predictions(
     min_len: int,
     max_len: int,
     seed: int | None,
+    *,
+    encoder_output_trim: bool = False,
+    encoder_output_drop_last_specials: int = 2,
+    chronos_input_patch_size: int = 16,
+    encoder_finetune_last_n: int = 0,
 ) -> None:
     n = len(ds)
     if n == 0:
@@ -161,13 +169,28 @@ def _print_random_sequence_predictions(
     samples = [ds[i] for i in idxs]
     base = collate_stack_lr_pad_batch(samples)
     x = normalize_mv(base["imu_mv"], mean, std)
-    x = pad_crop_temporal(x, context_length)
+    lengths = base["lengths"].to(device=device, dtype=torch.long)
+    x = pad_crop_temporal(x, context_length).to(device)
     y = base["label_id"].to(device)
     bsz = int(x.shape[0])
 
     with torch.no_grad():
-        emb_list, _ = pipeline.embed(x.float(), batch_size=bsz, context_length=context_length)
-        stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+        if encoder_finetune_last_n > 0:
+            set_encoder_finetune_train_mode(pipeline.model, encoder_finetune_last_n, training=False)
+            stacked = chronos_encode_multivariate_grad(
+                pipeline, x.float(), context_length=context_length
+            ).to(device, dtype=torch.float32)
+        else:
+            emb_list, _ = pipeline.embed(x.float(), batch_size=bsz, context_length=context_length)
+            stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+        stacked = apply_stage1_encoder_trim(
+            stacked,
+            lengths,
+            enabled=encoder_output_trim,
+            context_length=context_length,
+            input_patch_size=chronos_input_patch_size,
+            drop_last_specials=encoder_output_drop_last_specials,
+        )
         logits = head(stacked)
         probs = torch.softmax(logits, dim=1)
         top_p, top_i = probs.topk(k=min(5, probs.shape[1]), dim=1)
@@ -251,6 +274,10 @@ def main() -> None:
     ckpt = torch.load(head_ckpt_path, map_location="cpu", weights_only=False)
     d_model = int(ckpt["d_model"])
     ckpt_num_classes = int(ckpt["num_classes"])
+    ft_n = int(ckpt.get("encoder_finetune_last_n") or 0)
+    if ft_n == 0:
+        tc = meta.get("training_config") or {}
+        ft_n = int(tc.get("encoder_finetune_last_n") or 0)
     if ckpt_num_classes != num_classes:
         raise ValueError(
             f"Class mismatch: checkpoint has {ckpt_num_classes}, vocab has {num_classes}. "
@@ -259,17 +286,55 @@ def main() -> None:
     head = load_stage1_head_from_checkpoint(ckpt, d_model=d_model, num_classes=num_classes, device=device)
     head.eval()
 
+    md = ckpt.get("model_state_dict")
+    if md:
+        pipeline.model.load_state_dict({k: v.to(device) for k, v in md.items()}, strict=True)
+    elif ft_n > 0:
+        print(
+            "WARNING: encoder_finetune_last_n>0 in meta/checkpoint but no model_state_dict in head checkpoint; "
+            "using base Chronos weights (evaluation may not match training)."
+        )
+
+    hc = ckpt.get("head_config") or {}
+    tc = meta.get("training_config") or {}
+    enc_trim = bool(hc.get("encoder_output_trim", hc.get("encoder_output_masking", False)))
+    enc_drop = int(
+        hc.get("encoder_output_drop_last_specials", hc.get("encoder_output_drop_last_tokens", 2))
+    )
+    patch_sz = int(hc.get("chronos_input_patch_size") or tc.get("chronos_input_patch_size") or 16)
+    if enc_trim:
+        print(
+            f"Encoder output trim (from checkpoint): enabled=True drop_last_specials={enc_drop} patch_size={patch_sz}"
+        )
+    if ft_n > 0:
+        print(f"Encoder fine-tune eval: last {ft_n} block(s) use encode() path + loaded weights when present.")
+
     cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     totals = {"n": 0, "loss_sum": 0.0, "top1_sum": 0.0, "top3_sum": 0.0, "top5_sum": 0.0}
 
     with torch.no_grad():
         for batch in loader:
-            imu = batch["imu_mv"].float()
+            imu = batch["imu_mv"].float().to(device)
             y = batch["label_id"].to(device)
+            lengths = batch["lengths"].to(device=device, dtype=torch.long)
             bsz = int(imu.shape[0])
 
-            emb_list, _ = pipeline.embed(imu, batch_size=bsz, context_length=context_length)
-            stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+            if ft_n > 0:
+                set_encoder_finetune_train_mode(pipeline.model, ft_n, training=False)
+                stacked = chronos_encode_multivariate_grad(
+                    pipeline, imu, context_length=context_length
+                ).to(device, dtype=torch.float32)
+            else:
+                emb_list, _ = pipeline.embed(imu, batch_size=bsz, context_length=context_length)
+                stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+            stacked = apply_stage1_encoder_trim(
+                stacked,
+                lengths,
+                enabled=enc_trim,
+                context_length=context_length,
+                input_patch_size=patch_sz,
+                drop_last_specials=enc_drop,
+            )
             logits = head(stacked)
             loss = F.cross_entropy(logits, y)
 
@@ -298,6 +363,10 @@ def main() -> None:
             min_len=args.random_seq_min_len,
             max_len=args.random_seq_max_len,
             seed=args.random_seq_seed,
+            encoder_output_trim=enc_trim,
+            encoder_output_drop_last_specials=enc_drop,
+            chronos_input_patch_size=patch_sz,
+            encoder_finetune_last_n=ft_n,
         )
 
     n = max(totals["n"], 1)
@@ -357,6 +426,7 @@ def main() -> None:
         "context_length": context_length,
         "device": str(device),
         "out_dir": str(out_dir.resolve()),
+        "encoder_finetune_last_n": int(ft_n),
     }
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
