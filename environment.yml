@@ -14,8 +14,6 @@ dependencies:
   - pandas
   - matplotlib
   - seaborn
-  - scipy
-  - scikit-learn
 
   # PyTorch CUDA 12.1 stack used by current training scripts
   - pytorch=2.5.1
@@ -27,9 +25,7 @@ dependencies:
   - pip:
       - accelerate==1.12.0
       - chronos-forecasting>=2.0
-      - einops
       - huggingface_hub==1.3.4
-      - momentfm==0.1.4
       - optuna>=3.0
       - peft==0.18.1
       - pyyaml>=6.0
@@ -39,4 +35,4 @@ dependencies:
       - transformers==5.0.0
 
 # Safety check after env creation (project-relevant imports):
-#   conda run -n ring2text python -c "import torch; import chronos; import momentfm; import optuna; import yaml"
+#   conda run -n ring2text python -c "import torch; import chronos; import optuna; import yaml"
