@@ -11,7 +11,7 @@
 # Baseline (unchanged): configs/experiments/exp_conv1d.yaml → checkpoints/exp_stage1_conv1d
 
 paths:
-  export_dir: stage1_export_coarse_rare_all_p
+  export_dir: exports/stage1_export_coarse_rare_all_p
   data_dir: data
   out_dir: checkpoints/exp_stage1_conv1d_regularized
   log_file: null

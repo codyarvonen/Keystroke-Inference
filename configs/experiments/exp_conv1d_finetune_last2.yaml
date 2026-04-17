@@ -5,7 +5,7 @@
 #   python train_stage1_chronos.py --config configs/experiments/exp_conv1d_finetune_last2.yaml
 
 paths:
-  export_dir: stage1_export_coarse_rare_all_p
+  export_dir: exports/stage1_export_coarse_rare_all_p
   data_dir: data
   out_dir: checkpoints/exp_stage1_conv1d_finetune_last2
   log_file: null

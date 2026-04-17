@@ -8,7 +8,7 @@
 #   python train_stage1_chronos.py --config configs/experiments/exp_conv1d_phase2_500_500_hpo.yaml
 
 paths:
-  export_dir: stage1_export_holdout_randval_coarse_l500_r500
+  export_dir: exports/stage1_export_holdout_randval_coarse_l500_r500
   data_dir: data
   out_dir: checkpoints/hpo_phase2/manual_baseline
   log_file: null

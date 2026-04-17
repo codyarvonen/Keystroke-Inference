@@ -9,7 +9,7 @@
 #   python evaluate_stage1_chronos.py --head-ckpt checkpoints/hpo_phase2/best_so_far_manual/head.pt --meta-path checkpoints/hpo_phase2/best_so_far_manual/train_meta.json --norm-stats checkpoints/hpo_phase2/trials_phase2a/shared_norm_stats.json --split test
 
 paths:
-  export_dir: stage1_export_holdout_randval_coarse_l500_r500
+  export_dir: exports/stage1_export_holdout_randval_coarse_l500_r500
   data_dir: data
   out_dir: checkpoints/hpo_phase2/best_so_far_manual
   log_file: null

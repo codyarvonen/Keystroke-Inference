@@ -7,7 +7,7 @@ from .stage1 import (
     build_stage1_vocab_from_train,
     export_stage1_to_dir,
     load_stage1_vocab,
-    stage1_export_config_from_manifest,
+    exports/stage1_export_config_from_manifest,
 )
 from .windows import WindowRecord
 
@@ -37,7 +37,7 @@ __all__ = [
     "build_stage1_vocab_from_train",
     "export_stage1_to_dir",
     "load_stage1_vocab",
-    "stage1_export_config_from_manifest",
+    "exports/stage1_export_config_from_manifest",
     "make_dataloaders",
     "make_splits",
 ]

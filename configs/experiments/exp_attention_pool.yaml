@@ -1,8 +1,8 @@
-# Attention-pool head; coarse 32-class JSONL (stage1_export_coarse32). Loss: weighted CE + inverse_sqrt (defaults recipe).
+# Attention-pool head; coarse 32-class JSONL (exports/stage1_export_coarse32). Loss: weighted CE + inverse_sqrt (defaults recipe).
 # Run: python train_stage1_chronos.py --config configs/experiments/exp_attention_pool.yaml
 
 paths:
-  export_dir: stage1_export_coarse32
+  export_dir: exports/stage1_export_coarse32
   data_dir: data
   out_dir: checkpoints/exp_stage1_attention_pool
   log_file: null

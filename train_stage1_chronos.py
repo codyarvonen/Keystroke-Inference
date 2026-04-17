@@ -80,7 +80,7 @@ def _require_chronos():
 
 # Single source of truth for argparse dest names / YAML keys (snake_case).
 TRAINING_DEFAULTS: Dict[str, Any] = {
-    "export_dir": "stage1_export",
+    "export_dir": "exports/stage1_export",
     "data_dir": "data",
     "chronos_model": "autogluon/chronos-2-small",
     "device": "cuda:1",

@@ -2,7 +2,7 @@
 # Run: python train_stage1_chronos.py --config configs/experiments/exp_attention_pool_plain_ce.yaml
 
 paths:
-  export_dir: stage1_export_coarse32
+  export_dir: exports/stage1_export_coarse32
   data_dir: data
   out_dir: checkpoints/exp_stage1_attention_pool_plain_ce
   log_file: null

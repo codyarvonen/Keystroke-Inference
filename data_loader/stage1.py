@@ -506,7 +506,7 @@ def row_to_export_record(
     return d
 
 
-def stage1_export_config_from_manifest(
+def exports/stage1_export_config_from_manifest(
     manifest: Mapping[str, Any],
     *,
     data_dir: Optional[str] = None,
@@ -572,7 +572,7 @@ def export_stage1_to_dir(
         written_per_split[split_name] = len(split_rows)
 
     manifest: Dict[str, Any] = {
-        "stage1_export_version": 1,
+        "exports/stage1_export_version": 1,
         "config": {
             "data_dir": cfg.data_dir,
             "left_context_ms": cfg.left_context_ms,

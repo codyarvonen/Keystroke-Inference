@@ -29,7 +29,7 @@ Example:
 
 ```bash
 python export_stage1_data.py \
-  --out-dir stage1_export_coarse_rare_all_p \
+  --out-dir exports/stage1_export_coarse_rare_all_p \
   --data-dir data \
   --left-ms 700 \
   --right-ms 150 \
@@ -120,6 +120,61 @@ Common experiment configs in this branch:
   - loss/head setup
   - cache metadata
   - best epoch/metric
+
+### Phase-2 HPO updates (Mode A)
+
+Recent HPO updates were made to reduce per-trial overhead and align evaluation with model-selection best practices:
+
+- Shared normalization stats for all trials (`norm_stats_path`), so trials do not recompute train global stats.
+- Shared embedding cache reuse across trials via stable cache signatures and shared norm stats path.
+- Consolidated trial logging into one file at `checkpoints/hpo_phase2/trials_phase2a/hpo_trials.log`.
+- Per-trial test evaluation disabled during HPO (`--no-eval-test-split` in trial runs) to save runtime.
+- One final test evaluation is run only for the best validation trial at the end of HPO.
+
+Key configs/scripts:
+
+- `configs/experiments/exp_conv1d_phase2_500_500_hpo.yaml`
+- `train_stage1_hpo_optuna.py`
+- `train_stage1_chronos.py`
+- `evaluate_stage1_chronos.py`
+
+### Current best Phase-2 Mode A result (so far)
+
+From the current `trials_phase2a` run snapshot:
+
+- Best trial: `trial_0002`
+- Best val loss: `1.113043`
+- Best val top-1: `0.654226`
+- Best epoch: `4`
+- Best params:
+  - `lr=1.383e-4`
+  - `weight_decay=0.01016`
+  - `batch_size=16`
+  - `head_dropout=0.1152`
+  - `head_hidden_dim=384`
+  - `head_conv_channels=384`
+  - `head_conv_kernel_size=5`
+  - `head_conv_num_layers=2`
+
+Pinned best-so-far config:
+
+- `configs/experiments/exp_conv1d_phase2_500_500_best_so_far.yaml`
+
+### Phase-1 window sweep summary
+
+`plots/hpo_phase1_window_sweep.csv` indicates the best tested context split is:
+
+- `left_ms=500`, `right_ms=500` (total `1000 ms`)
+- `best_val_loss=1.139492`
+- `test_loss=1.0877`
+- `test_top1=0.6717`
+
+This `500/500` window is now the default basis for Phase-2 Mode A experiments.
+
+### Project housekeeping conventions
+
+- Stage-1 export datasets now live under `exports/` (for example `exports/stage1_export_holdout_randval_coarse_l500_r500`).
+- Runtime `output_*.log` files now live under `outputs/`.
 
 ### Fine-tuning path
 

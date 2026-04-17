@@ -18,7 +18,7 @@ from data_loader.stage1 import export_stage1_to_dir
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Export Stage-1 rows and vocabulary.")
-    p.add_argument("--out-dir", type=str, default="stage1_export", help="Output directory")
+    p.add_argument("--out-dir", type=str, default="exports/stage1_export", help="Output directory")
     p.add_argument("--data-dir", type=str, default="data")
     p.add_argument("--left-ms", type=int, default=700)
     p.add_argument("--right-ms", type=int, default=150)

@@ -32,7 +32,7 @@ Use the first row for “loss as in defaults” and the second row to compare **
 
 Each file sets its own `paths.out_dir` under `checkpoints/` so runs do not overwrite.
 
-All configs here use **`paths.export_dir: stage1_export_coarse32`** (32-class coarse labels). Produce that export with `export_stage1_data.py --coarse-labels --out-dir stage1_export_coarse32` (or change the path consistently).
+All configs here use **`paths.export_dir: exports/stage1_export_coarse32`** (32-class coarse labels). Produce that export with `export_stage1_data.py --coarse-labels --out-dir exports/stage1_export_coarse32` (or change the path consistently).
 
 Edit `paths.data_dir` and `model.device` to match your machine.
 

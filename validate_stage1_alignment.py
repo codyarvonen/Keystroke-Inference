@@ -3,7 +3,7 @@
 Validate Stage-1 keypress-to-IMU alignment and export schema readiness.
 
 Rebuilds rows from raw session files under --data-dir (same code path as export), not from
-JSONL shards. Use --export-dir path/to/stage1_export to load manifest.json so settings
+JSONL shards. Use --export-dir path/to/exports/stage1_export to load manifest.json so settings
 (including merge_letter_case) match that export.
 """
 
@@ -13,7 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 from data_loader.config import Stage1ExportConfig
-from data_loader.stage1 import build_stage1_rows, stage1_export_config_from_manifest
+from data_loader.stage1 import build_stage1_rows, exports/stage1_export_config_from_manifest
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,7 +98,7 @@ def main() -> None:
         if not manifest_path.is_file():
             raise FileNotFoundError(f"Missing {manifest_path}")
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        cfg = stage1_export_config_from_manifest(manifest, data_dir=args.data_dir)
+        cfg = exports/stage1_export_config_from_manifest(manifest, data_dir=args.data_dir)
         print(
             f"Config from manifest: {manifest_path.resolve()} "
             f"(merge_letter_case={cfg.merge_letter_case}, coarse_labels={cfg.coarse_labels}, "

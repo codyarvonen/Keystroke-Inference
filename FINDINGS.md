@@ -13,19 +13,82 @@ This document summarizes the progression of Stage 1 experiments across the speci
   - Test loss: `1.1170 -> 0.9585`
 - The largest gains came from (1) the Conv1D head over frozen Chronos tokens, (2) the `coarse_rare_all_p` export including a second participant, (3) regularization, and (4) fine-tuning the last two encoder blocks.
 
+## Phase-1 Windowing Sweep (Holdout + Coarse)
+
+Window sweep results are tracked in `plots/hpo_phase1_window_sweep.csv`.
+
+Best tested window:
+
+- `left_ms=500`, `right_ms=500` (total `1000 ms`)
+- `best_val_loss=1.139492`
+- `test_loss=1.0877`
+- `test_top1=0.6717`
+
+Notable pattern:
+
+- Very short right context (`50 ms`) underperforms strongly (`test_top1` down to ~`0.58-0.59`).
+- Balanced context (`500/500`) outperformed longer but right-light or right-heavy alternatives in this sweep.
+
+Decision:
+
+- Use `500/500` as the Phase-2 baseline window for further tuning.
+
+## Phase-2 Mode A (Frozen encoder + cache + HPO)
+
+Mode A setup:
+
+- Frozen Chronos encoder (`freeze_encoder=true`)
+- Memmap embedding cache (`embedding_cache_storage=memmap`)
+- Conv1D head search with Optuna
+- Coarse holdout export at `500/500` window
+
+### HPO system improvements implemented
+
+- Shared norm stats path across trials to avoid per-trial global norm recomputation.
+- Shared embedding cache reuse across trials (stable cache signatures).
+- Single shared trial log file (`checkpoints/hpo_phase2/trials_phase2a/hpo_trials.log`).
+- Per-trial test pass removed during HPO (validation-only objective).
+- One final test evaluation for the best validation trial after study completion.
+
+These changes reduced avoidable per-trial startup/eval overhead and made HPO logs/artifacts easier to audit.
+
+### Best-so-far Phase-2 Mode A result
+
+Current best in `checkpoints/hpo_phase2/trials_phase2a`:
+
+- Trial: `trial_0002`
+- Best val loss: `1.113043`
+- Best val top-1: `0.654226`
+- Best epoch: `4`
+
+Best-so-far hyperparameters:
+
+- `lr=0.00013833898215127175`
+- `weight_decay=0.010162673904953734`
+- `batch_size=16`
+- `head_dropout=0.11522355427036489`
+- `head_hidden_dim=384`
+- `head_conv_channels=384`
+- `head_conv_kernel_size=5`
+- `head_conv_num_layers=2`
+
+Pinned config for reproducible single-run training:
+
+- `configs/experiments/exp_conv1d_phase2_500_500_best_so_far.yaml`
+
 ## Run-by-Run Results
 
 > Notes on comparability:
 >
-> - `stage1_chronos/train.log` uses `stage1_export` with 71 classes.
+> - `stage1_chronos/train.log` uses `exports/stage1_export` with 71 classes.
 > - `stage1_chronos_coarse32` and `exp_stage1_attention_pool` use coarse32 exports with 34 classes.
-> - `exp_stage1_conv1d*` runs use `stage1_export_coarse_rare_all_p` with 34 classes and substantially larger sample count.
+> - `exp_stage1_conv1d*` runs use `exports/stage1_export_coarse_rare_all_p` with 34 classes and substantially larger sample count.
 > - Metrics across different datasets/class spaces are directionally useful but not directly apples-to-apples.
 
 
 | Run                                                                             | Data / classes         | Best epoch (val loss) | Test top1 | Test top3 | Test top5 | Eval micro/macro/weighted F1  |
 | ------------------------------------------------------------------------------- | ---------------------- | --------------------- | --------- | --------- | --------- | ----------------------------- |
-| `checkpoints/stage1_chronos/train.log`                                          | `stage1_export` / 71   | 24                    | 0.2532    | 0.4254    | 0.5557    | 0.2928 / 0.0774 / 0.2734      |
+| `checkpoints/stage1_chronos/train.log`                                          | `exports/stage1_export` / 71   | 24                    | 0.2532    | 0.4254    | 0.5557    | 0.2928 / 0.0774 / 0.2734      |
 | `checkpoints/stage1_chronos_coarse32/train_20260410_132742_616908.log`          | coarse32 / 34          | 28                    | 0.2560    | 0.4387    | 0.5709    | N/A (no `eval_test` artifact) |
 | `checkpoints/exp_stage1_attention_pool/train_20260411_145153_411755.log`        | coarse32 / 34          | 99                    | 0.3082    | 0.5127    | 0.6403    | 0.3082 / 0.1562 / 0.2858      |
 | `checkpoints/exp_stage1_conv1d/train_20260411_151905_823333.log`                | pre-`all_p` coarse32 / 34 | 3                  | 0.5013    | 0.7583    | 0.8680    | N/A (no `eval_test` artifact) |
@@ -57,7 +120,7 @@ This document summarizes the progression of Stage 1 experiments across the speci
 
 ### 4) Second participant in the dataset (`coarse_rare_all_p` / `all_p`)
 
-- Export `stage1_export_coarse_rare_all_p` adds sessions from an additional participant compared to the earlier coarse32-only pipeline used for `train_20260411_151905_823333.log`.
+- Export `exports/stage1_export_coarse_rare_all_p` adds sessions from an additional participant compared to the earlier coarse32-only pipeline used for `train_20260411_151905_823333.log`.
 - Split sizes for the earlier Conv1D run: train `n=27,310`, val `n=4,845`, test `n=9,168`. For Conv1D on `all_p`: train `n=88,543`, val `n=8,588`, test `n=26,034` (`train_20260411_202339_548032.log`).
 - Same head and training recipe (`exp_conv1d.yaml`): test top-1 moves from `0.5013` to `0.6445`, test loss from `1.7416` to `1.1893`. Macro F1 on the held-out eval run is `0.5109` for the `all_p` model (`eval_test/metrics.json`).
 - The extra participant and larger row counts improve generalization. Overfitting remains visible (train loss keeps falling after the best validation epoch). Plan for more participant diversity and stronger tail-class handling (regularization, sampling), not only model capacity.

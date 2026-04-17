@@ -7,7 +7,7 @@
 # them under arbitrary section headings (paths:, training:, …); unknown keys warn.
 
 paths:
-  export_dir: stage1_export
+  export_dir: exports/stage1_export
   data_dir: data
   out_dir: checkpoints/stage1_chronos
   log_file: null  # default: <out_dir>/train_<timestamp>.log (new file each run)
