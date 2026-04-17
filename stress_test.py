@@ -2,7 +2,7 @@ import torch
 from transformers import GPT2LMHeadModel, GPT2Config
 
 # 1. Setup Device
-device = "cuda:0" 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 2. Configuration & Model Loading
 print("Loading GPT-2 Small...")

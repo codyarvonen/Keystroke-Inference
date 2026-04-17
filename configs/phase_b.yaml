@@ -1,0 +1,69 @@
+# Phase B — multi-task fine-tuning: keystroke-activity + LM.
+#
+# Loads a Phase-A pretrained adapter (which already grounds IMU into
+# per-frame keystroke timing) and adds the frozen Qwen2.5-1.5B LLM via
+# soft-token prefix. The KeystrokeHead stays active at low weight so the
+# adapter cannot regress and forget rhythm grounding while the LM CE tries
+# to add content. No explicit event→char mapper is trained — the frozen LLM
+# is the only path from rhythm to text.
+#
+# Required: a Phase-A checkpoint to seed the adapter.
+#
+# Usage:
+#   python train.py --config configs/phase_b.yaml \
+#                   --adapter_init ./checkpoints/phase_a/adapter_best.pt
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val.pt"
+
+# --- Model ---
+skip_llm: false
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 9216
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+lora_rank: 0               # Try 8 if Phase B plateaus and we need LLM capacity
+
+# --- Training ---
+epochs: 100
+batch_size: 16
+lr: 3.0e-5
+weight_decay: 0.1
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 0.5
+
+# --- Losses ---
+# Keystroke activity + onset stay on (smaller weight each) to keep the adapter
+# grounded in rhythm; LM cross-entropy adds content via the frozen LLM.
+# Legacy div/recon/contrast losses default off — Phase A's keystroke
+# supervision makes them redundant. Re-enable cautiously if collapse reappears
+# (look at the soft-token cosine-sim diagnostic in logs).
+keystroke_weight: 0.3
+onset_weight: 0.3
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+# --- Required init ---
+# Phase B is meaningless without a Phase-A pretrained adapter; train.py errors
+# if --adapter_init is missing so the run can't silently start from scratch.
+require_adapter_init: true
+
+# --- Logging / saving ---
+save_dir: "./checkpoints/phase_b"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 5

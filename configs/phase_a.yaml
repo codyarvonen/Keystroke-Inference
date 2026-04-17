@@ -1,0 +1,64 @@
+# Phase A — Keystroke-activity adapter pretraining.
+#
+# Skips the LLM entirely. The adapter + KeystrokeHead learn IMU -> per-frame
+# binary "is a key being pressed at this time?" supervision derived from PKL
+# key_times intervals. This is the primary content-grounding signal —
+# previous runs showed the LM cross-entropy alone could not teach the
+# adapter to use the IMU signal at all. Binary activity is deliberately the
+# lowest-information target; if Phase B fails to echo content, escalate to
+# per-hand or per-region targets before going back to per-key classes.
+#
+# Output: a checkpoint with adapter + keystroke_head weights that Phase B
+# loads via --adapter_init.
+#
+# Usage:
+#   python train.py --config configs/phase_a.yaml
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val.pt"
+
+# --- Model (LLM disabled) ---
+skip_llm: true
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"   # ignored when skip_llm=true; kept for arg parsing
+d_chronos: 9216
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+lora_rank: 0
+
+# --- Training ---
+epochs: 100
+batch_size: 32             # No LLM in memory → can use a larger batch
+lr: 3.0e-4                 # Higher than Phase B: only ~4M params, no frozen LLM gradient flow
+weight_decay: 0.05
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 1.0         # Looser; BCE gradients are well-behaved
+
+# --- Losses ---
+# Dual-head keystroke supervision: dense activity BCE + sparse onset focal.
+# Activity gives a smooth "is a key being pressed" signal (easy to learn,
+# plateaus around frame_F1 ~0.76). Onset adds per-keypress impulse targets so
+# the adapter is forced to produce crisp rising edges — Run 13's onset_F1
+# stalled at 0.10 because the single-head BCE+temporal-conv blurred onsets.
+keystroke_weight: 1.0
+onset_weight: 1.0
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0            # Keystroke BCE enforces input-conditional outputs
+recon_weight: 0.0
+contrast_weight: 0.0
+
+# --- Logging / saving ---
+save_dir: "./checkpoints/phase_a"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 8

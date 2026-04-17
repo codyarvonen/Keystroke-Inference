@@ -6,14 +6,8 @@ import pandas as pd
 
 from .config import DataConfig
 from .sessions import load_session_raw
-
-
-def get_time_column(df: pd.DataFrame) -> str:
-    if "Effective Timestamp" in df.columns:
-        return "Effective Timestamp"
-    if "Time Stamp" in df.columns:
-        return "Time Stamp"
-    raise ValueError("No timestamp column found.")
+from utils.constants import IMU_COLS
+from utils.imu_io import get_time_column
 
 
 def align_rings_to_grid(
@@ -37,13 +31,12 @@ def align_rings_to_grid(
     dt = 1.0 / target_rate_hz
     time_grid = np.arange(t_start, t_end, dt, dtype=np.float64)
 
-    imu_cols = ["Accel-x", "Accel-y", "Accel-z", "Gyro-x", "Gyro-y", "Gyro-z"]
-    L_vals = imu_L[imu_cols].to_numpy(dtype=np.float32)
-    R_vals = imu_R[imu_cols].to_numpy(dtype=np.float32)
+    L_vals = imu_L[IMU_COLS].to_numpy(dtype=np.float32)
+    R_vals = imu_R[IMU_COLS].to_numpy(dtype=np.float32)
 
-    imu_L_grid = np.empty((time_grid.shape[0], len(imu_cols)), dtype=np.float32)
+    imu_L_grid = np.empty((time_grid.shape[0], len(IMU_COLS)), dtype=np.float32)
     imu_R_grid = np.empty_like(imu_L_grid)
-    for i in range(len(imu_cols)):
+    for i in range(len(IMU_COLS)):
         imu_L_grid[:, i] = np.interp(time_grid, tL, L_vals[:, i])
         imu_R_grid[:, i] = np.interp(time_grid, tR, R_vals[:, i])
 

@@ -1,0 +1,69 @@
+# Phase A (MOMENT) — seq2seq character decoder on 32 resampler soft tokens.
+#
+# Hypothesis: the CTC T≥L length constraint (T=32 resampler tokens < L_max=52)
+# is why ctc_CER on 32 tokens was 0.791. A teacher-forced cross-attention
+# decoder has no length constraint — it treats the 32 tokens as compressed
+# memory and queries them once per output character.
+#
+# This is a direct head-to-head against the CTC-on-resampler diagnostic:
+#   - CTC on resampler_out (32 tokens): ctc_CER 0.791  (length-infeasible)
+#   - Seq2seq on resampler_out (32 tokens): ??? (no T≥L constraint)
+#
+# Success bar: val seq2seq_CER < 0.5. If seq2seq decodes cleanly from 32
+# tokens while CTC could not, the resampler is NOT the bottleneck — CTC's
+# length constraint was. If seq2seq_CER is still > 0.7, the resampler is
+# genuinely lossy and escalation to n_soft_tokens=64+ is warranted.
+#
+# Usage:
+#   python train.py --config configs/phase_a_moment_seq2seq.yaml
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train_moment.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val_moment.pt"
+
+# --- Model (LLM disabled) ---
+skip_llm: true
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 12288
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+lora_rank: 0
+
+# --- Seq2seq head ---
+char_seq2seq_weight: 0.5
+
+# --- CTC (disabled) ---
+char_ctc_weight: 0.0
+ctc_upsample_factor: 1
+
+# --- Training ---
+epochs: 100
+batch_size: 32
+lr: 3.0e-4
+weight_decay: 0.05
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 1.0
+
+# --- Losses ---
+keystroke_weight: 1.0
+onset_weight: 1.0
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+save_dir: "./checkpoints/phase_a_moment_seq2seq"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 8

@@ -1,0 +1,64 @@
+# Phase B — MOMENT encoder, attn+MLP LoRA on Qwen2.5-1.5B (~9.8M params).
+#
+# Full LoRA target list: q/k/v/o + gate/up/down. Much higher capacity than
+# attn-only — real overfitting risk vs. 3465 train samples — so only run if
+# attn-only variant left a content gap. Abort if train-val gap at step 500 is
+# > 0.6 nats and widening at step 1000; rollback to lora_rank=4 (~4.9M params).
+#
+# Requires a Phase-A MOMENT checkpoint:
+#   python train.py --config configs/phase_b_moment_lora_full.yaml \
+#                   --adapter_init ./checkpoints/phase_a_moment/adapter_best.pt
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train_moment.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val_moment.pt"
+
+# --- Model ---
+skip_llm: false
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 12288
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+
+# --- LoRA (attn + MLP, default Qwen targets) ---
+lora_rank: 8
+lora_alpha: 16.0
+lora_dropout: 0.1
+lora_target_modules: null
+
+# --- Adapter freezing ---
+freeze_resampler: true
+
+# --- Training ---
+epochs: 100
+batch_size: 16
+lr: 3.0e-5
+weight_decay: 0.1
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 0.5
+
+# --- Losses ---
+keystroke_weight: 0.3
+onset_weight: 0.3
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+require_adapter_init: true
+
+save_dir: "./checkpoints/phase_b_moment_lora_full"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 5

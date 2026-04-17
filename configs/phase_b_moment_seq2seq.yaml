@@ -1,0 +1,72 @@
+# Phase B (MOMENT) — LoRA attn + seq2seq-grounded adapter.
+#
+# Seeded from phase_a_moment_seq2seq/adapter_best.pt.
+# char_seq2seq_weight=0.0: Phase A already grounded the adapter via seq2seq
+# supervision; the decoder gradient in Phase B competes with LM supervision.
+# Raise to 0.1 if LLM-CER stalls >= 1.0.
+#
+# Same LoRA configuration as the winning Run 18m variant (attn-only, r=8).
+#
+# Usage:
+#   python train.py --config configs/phase_b_moment_seq2seq.yaml \
+#                   --adapter_init ./checkpoints/phase_a_moment_seq2seq/adapter_best.pt
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train_moment.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val_moment.pt"
+
+# --- Model ---
+skip_llm: false
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 12288
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+
+# --- LoRA (attn-only, winning variant from Run 18m) ---
+lora_rank: 8
+lora_alpha: 16.0
+lora_dropout: 0.1
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+freeze_resampler: false
+
+# --- Seq2seq head (loaded from Phase A, inactive during Phase B) ---
+char_seq2seq_weight: 0.0
+
+# --- CTC (disabled) ---
+char_ctc_weight: 0.0
+ctc_upsample_factor: 1
+
+# --- Training ---
+epochs: 100
+batch_size: 16
+lr: 3.0e-5
+weight_decay: 0.1
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 0.5
+
+# --- Losses ---
+keystroke_weight: 0.3
+onset_weight: 0.3
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+require_adapter_init: true
+
+save_dir: "./checkpoints/phase_b_moment_seq2seq"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 5

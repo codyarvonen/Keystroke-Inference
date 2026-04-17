@@ -4,6 +4,8 @@ from typing import Dict, List, Mapping, Tuple
 import pandas as pd
 
 from .config import DataConfig, make_session_key, parse_subject_session
+from utils.constants import IMU_COLS
+from utils.imu_io import get_time_column
 
 
 def discover_sessions(cfg: DataConfig) -> Dict[str, Dict[str, Path]]:
@@ -73,14 +75,6 @@ def discover_sessions(cfg: DataConfig) -> Dict[str, Dict[str, Path]]:
     return complete_sessions
 
 
-def _get_time_column(df: pd.DataFrame) -> str:
-    if "Effective Timestamp" in df.columns:
-        return "Effective Timestamp"
-    if "Time Stamp" in df.columns:
-        return "Time Stamp"
-    raise ValueError("No timestamp column found in IMU dataframe.")
-
-
 def _compute_large_gaps(
     df: pd.DataFrame,
     time_col: str,
@@ -127,20 +121,18 @@ def load_session_raw(files: Mapping[str, Path]) -> Dict[str, object]:
     """
     result: Dict[str, object] = {}
 
-    imu_cols = ["Accel-x", "Accel-y", "Accel-z", "Gyro-x", "Gyro-y", "Gyro-z"]
-
     if "imu_L" in files:
         df_L = pd.read_csv(files["imu_L"])
         # Drop rows containing NaNs in IMU sensor columns
-        df_L = df_L.dropna(subset=[c for c in imu_cols if c in df_L.columns])
-        t_col_L = _get_time_column(df_L)
+        df_L = df_L.dropna(subset=[c for c in IMU_COLS if c in df_L.columns])
+        t_col_L = get_time_column(df_L)
         result["gaps_L"] = _compute_large_gaps(df_L, t_col_L)
         result["imu_L"] = df_L
 
     if "imu_R" in files:
         df_R = pd.read_csv(files["imu_R"])
-        df_R = df_R.dropna(subset=[c for c in imu_cols if c in df_R.columns])
-        t_col_R = _get_time_column(df_R)
+        df_R = df_R.dropna(subset=[c for c in IMU_COLS if c in df_R.columns])
+        t_col_R = get_time_column(df_R)
         result["gaps_R"] = _compute_large_gaps(df_R, t_col_R)
         result["imu_R"] = df_R
 
