@@ -200,6 +200,28 @@ def _assign_session_splits(
                 split_map[sess] = "train"
         return split_map
 
+    if cfg.session_split_strategy == "session_holdout_random_train_val":
+        test_sessions = set(cfg.test_sessions)
+        if not test_sessions:
+            raise ValueError(
+                "session_holdout_random_train_val requires --test-sessions "
+                "(or config.test_sessions) to be set"
+            )
+        unknown_test = test_sessions.difference(session_keys)
+        if unknown_test:
+            raise ValueError(f"Unknown test_sessions: {sorted(unknown_test)}")
+        if cfg.val_sessions:
+            raise ValueError(
+                "val_sessions is not used with session_holdout_random_train_val; "
+                "validation is sampled randomly from non-test rows."
+            )
+        for sess in session_keys:
+            if sess in test_sessions:
+                split_map[sess] = "test"
+            else:
+                split_map[sess] = "train"
+        return split_map
+
     # session_random: split by whole sessions (no within-session leakage).
     # train_only_sessions are excluded from the val/test pool and always go to train.
     pool = [k for k in session_keys if k not in train_only]
@@ -363,10 +385,36 @@ def build_stage1_rows(
 
         stats["by_session"][session_key] = dict(sess_stats)
 
+    if cfg.session_split_strategy == "session_holdout_random_train_val":
+        rng = np.random.default_rng(cfg.split_seed)
+        train_only = frozenset(cfg.train_only_sessions)
+        candidate_idx = [
+            i
+            for i, r in enumerate(rows)
+            if r.split == "train" and r.session_key not in train_only
+        ]
+        n_val_rows = int(round(len(candidate_idx) * cfg.val_ratio))
+        n_val_rows = max(0, min(n_val_rows, len(candidate_idx)))
+        if n_val_rows > 0:
+            shuffled = np.array(candidate_idx, dtype=np.int64)
+            rng.shuffle(shuffled)
+            val_idx = set(shuffled[:n_val_rows].tolist())
+            for i in val_idx:
+                rows[i].split = "val"
+
+            # Recompute by_split counts after row-level train/val reassignment.
+            by_split = Counter()
+            for r in rows:
+                by_split[r.split] += 1
+            stats["by_split"] = dict(by_split)
+
     sessions_by_split: Dict[str, List[str]] = {s: [] for s in ("train", "val", "test")}
     for session_key, sp in split_map.items():
         if sp in sessions_by_split:
             sessions_by_split[sp].append(session_key)
+    if cfg.session_split_strategy == "session_holdout_random_train_val":
+        # Val rows are sampled from non-test rows, so val is row-level (not session-level) in this mode.
+        sessions_by_split["val"] = []
     for sp in sessions_by_split:
         sessions_by_split[sp].sort()
     stats["sessions_by_split"] = sessions_by_split

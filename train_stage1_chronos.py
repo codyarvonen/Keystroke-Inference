@@ -95,6 +95,8 @@ TRAINING_DEFAULTS: Dict[str, Any] = {
     "target_rate_hz": 100.0,
     "out_dir": "checkpoints/stage1_chronos",
     "log_file": None,
+    "norm_stats_path": None,
+    "eval_test_split": True,
     "recompute_norm": False,
     "seed": 42,
     "patience": 0,
@@ -149,6 +151,8 @@ def _flatten_training_yaml(raw: Any, allowed: Mapping[str, Any]) -> Dict[str, An
         if not isinstance(node, dict):
             return
         for k, v in node.items():
+            if k in ("hpo",):
+                continue
             if k in keys:
                 out[k] = v
             elif isinstance(v, dict):
@@ -208,7 +212,7 @@ def dump_default_training_yaml() -> str:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--config", "-c", type=str, default=None, metavar="PATH", help="YAML training defaults")
     pre.add_argument(
@@ -216,7 +220,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print default settings as YAML and exit",
     )
-    pre_args, rest = pre.parse_known_args()
+    cli = sys.argv[1:] if argv is None else argv
+    pre_args, rest = pre.parse_known_args(cli)
     if pre_args.print_default_config:
         if yaml is None:
             print("PyYAML is not installed; printing Python dict instead:\n", file=sys.stderr)
@@ -278,6 +283,18 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=m["recompute_norm"],
         help="Recompute train norm stats even if file exists (default: from config or false)",
+    )
+    p.add_argument(
+        "--norm-stats-path",
+        type=str,
+        default=m["norm_stats_path"],
+        help="Optional shared norm stats JSON path (default: <out-dir>/norm_stats.json)",
+    )
+    p.add_argument(
+        "--eval-test-split",
+        action=argparse.BooleanOptionalAction,
+        default=m["eval_test_split"],
+        help="Run final test split evaluation after training (disable for HPO speed).",
     )
     p.add_argument("--seed", type=int, default=m["seed"])
     p.add_argument(
@@ -603,18 +620,20 @@ def evaluate(
     totals = {"n": 0, "loss": 0.0}
     acc_sums = {"top1": 0.0, "top3": 0.0, "top5": 0.0}
     for batch in loader:
-        imu = batch["imu_mv"].float().to(device)
+        imu_cpu = batch["imu_mv"].float()
         y = batch["label_id"].to(device)
-        b = imu.shape[0]
+        b = imu_cpu.shape[0]
         lengths = batch.get("lengths")
         if lengths is not None:
             lengths = lengths.to(device=device, dtype=torch.long)
         if encoder_finetune_last_n > 0:
+            imu = imu_cpu.to(device)
             stacked = chronos_encode_multivariate_grad(
                 pipeline, imu, context_length=context_length
             ).to(device, dtype=torch.float32)
         else:
-            emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
+            # Chronos embed() manages its own loader/pin-memory path; pass CPU tensors here.
+            emb_list, _ = pipeline.embed(imu_cpu, batch_size=b, context_length=context_length)
             stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
         stacked = apply_stage1_encoder_trim(
             stacked,
@@ -1092,11 +1111,15 @@ def _build_head_ckpt(
     return out
 
 
-def main() -> None:
+def run_training(
+    args: argparse.Namespace,
+    *,
+    optuna_trial: Any = None,
+    optuna_prune_min_epochs: int = 2,
+) -> Dict[str, Any]:
+    """Run one training job. If ``optuna_trial`` is set, reports val metrics and supports pruning."""
     _require_chronos()
     from chronos import Chronos2Pipeline
-
-    args = parse_args()
     finetune_n = int(getattr(args, "encoder_finetune_last_n", 0))
     if not args.freeze_encoder and finetune_n == 0:
         raise NotImplementedError(
@@ -1199,7 +1222,11 @@ def main() -> None:
     val_ds = Stage1IMUKeyDataset(export_dir / "val.jsonl", stage_cfg)
     test_ds = Stage1IMUKeyDataset(export_dir / "test.jsonl", stage_cfg)
 
-    stats_path = out_dir / "norm_stats.json"
+    if args.norm_stats_path:
+        stats_path = Path(args.norm_stats_path)
+    else:
+        stats_path = out_dir / "norm_stats.json"
+    stats_path.parent.mkdir(parents=True, exist_ok=True)
     if stats_path.exists() and not args.recompute_norm:
         mean, std, _eps = load_norm_stats(stats_path)
         logger.info("Loaded norm stats from %s", stats_path)
@@ -1452,6 +1479,10 @@ def main() -> None:
     early_stopped = False
     head_best_path = out_dir / "head_best.pt"
 
+    optuna_mod: Any = None
+    if optuna_trial is not None:
+        import optuna as optuna_mod  # type: ignore[no-redef]
+
     for epoch in range(1, args.epochs + 1):
         head.train()
         if finetune_n > 0:
@@ -1494,18 +1525,22 @@ def main() -> None:
                 n_seen += b
         else:
             for batch in train_loader:
-                imu = batch["imu_mv"].float().to(device)
+                imu_cpu = batch["imu_mv"].float()
                 y = batch["label_id"].to(device)
                 lengths = batch["lengths"].to(device=device, dtype=torch.long)
-                b = imu.shape[0]
+                b = imu_cpu.shape[0]
                 opt.zero_grad(set_to_none=True)
                 if finetune_n > 0:
+                    imu = imu_cpu.to(device)
                     stacked = chronos_encode_multivariate_grad(
                         pipeline, imu, context_length=int(args.context_length)
                     )
                 else:
                     with torch.no_grad():
-                        emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=args.context_length)
+                        # Keep embed() input on CPU; move returned stacked embeddings to training device.
+                        emb_list, _ = pipeline.embed(
+                            imu_cpu, batch_size=b, context_length=args.context_length
+                        )
                     stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
                 stacked = apply_stage1_encoder_trim(
                     stacked,
@@ -1573,6 +1608,11 @@ def main() -> None:
             )
 
         cur = val_m["loss"] if minimize else val_m["top1"]
+        if optuna_trial is not None and optuna_mod is not None:
+            optuna_trial.report(float(cur), int(epoch) - 1)
+            if int(epoch) >= int(optuna_prune_min_epochs) and optuna_trial.should_prune():
+                raise optuna_mod.TrialPruned()
+
         if minimize:
             improved = cur < (best_metric - args.min_delta)
         else:
@@ -1628,37 +1668,41 @@ def main() -> None:
     if best_model_state_cpu is not None:
         pipeline.model.load_state_dict({k: v.to(device) for k, v in best_model_state_cpu.items()})
 
-    if cache_enabled and test_loader is not None:
-        test_m = evaluate_cached(
-            head,
-            test_loader,
-            device,
-            criterion,
-            context_length=int(args.context_length),
-            encoder_output_trim=bool(args.encoder_output_trim),
-            encoder_output_drop_last_specials=int(args.encoder_output_drop_last_specials),
-            chronos_input_patch_size=int(args.chronos_input_patch_size),
+    test_m: Optional[Dict[str, float]] = None
+    if bool(args.eval_test_split):
+        if cache_enabled and test_loader is not None:
+            test_m = evaluate_cached(
+                head,
+                test_loader,
+                device,
+                criterion,
+                context_length=int(args.context_length),
+                encoder_output_trim=bool(args.encoder_output_trim),
+                encoder_output_drop_last_specials=int(args.encoder_output_drop_last_specials),
+                chronos_input_patch_size=int(args.chronos_input_patch_size),
+            )
+        else:
+            test_m = evaluate(
+                pipeline,
+                head,
+                test_loader_raw,
+                device,
+                args.context_length,
+                criterion,
+                encoder_output_trim=bool(args.encoder_output_trim),
+                encoder_output_drop_last_specials=int(args.encoder_output_drop_last_specials),
+                chronos_input_patch_size=int(args.chronos_input_patch_size),
+                encoder_finetune_last_n=int(finetune_n),
+            )
+        logger.info(
+            "test  loss=%.4f  top1/3/5=%.4f/%.4f/%.4f",
+            test_m["loss"],
+            test_m["top1"],
+            test_m["top3"],
+            test_m["top5"],
         )
     else:
-        test_m = evaluate(
-            pipeline,
-            head,
-            test_loader_raw,
-            device,
-            args.context_length,
-            criterion,
-            encoder_output_trim=bool(args.encoder_output_trim),
-            encoder_output_drop_last_specials=int(args.encoder_output_drop_last_specials),
-            chronos_input_patch_size=int(args.chronos_input_patch_size),
-            encoder_finetune_last_n=int(finetune_n),
-        )
-    logger.info(
-        "test  loss=%.4f  top1/3/5=%.4f/%.4f/%.4f",
-        test_m["loss"],
-        test_m["top1"],
-        test_m["top3"],
-        test_m["top5"],
-    )
+        logger.info("Skipping test split evaluation (--no-eval-test-split).")
 
     ckpt = _build_head_ckpt(
         head,
@@ -1690,6 +1734,25 @@ def main() -> None:
         }
     )
     (out_dir / "train_meta.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+
+    return {
+        "best_epoch": int(best_epoch),
+        "best_metric_name": str(args.early_stopping_metric),
+        "best_metric_value": float(best_metric),
+        "best_val_metrics": dict(best_val_snapshot),
+        "test_loss": float(test_m["loss"]) if test_m is not None else None,
+        "test_top1": float(test_m["top1"]) if test_m is not None else None,
+        "test_top3": float(test_m["top3"]) if test_m is not None else None,
+        "test_top5": float(test_m["top5"]) if test_m is not None else None,
+        "early_stopped": bool(early_stopped),
+        "out_dir": str(out_dir.resolve()),
+        "log_file": str(log_path.resolve()),
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    run_training(args)
 
 
 if __name__ == "__main__":

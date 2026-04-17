@@ -1,0 +1,88 @@
+# Phase-2 training + Optuna HPO (Mode A: frozen encoder + embedding cache, default memmap).
+# Window fixed at 500/500 ms on the coarse 32-class holdout export.
+#
+# Run Optuna driver:
+#   python train_stage1_hpo_optuna.py --config configs/experiments/exp_conv1d_phase2_500_500_hpo.yaml
+#
+# Train once without HPO (ignores hpo: block):
+#   python train_stage1_chronos.py --config configs/experiments/exp_conv1d_phase2_500_500_hpo.yaml
+
+paths:
+  export_dir: stage1_export_holdout_randval_coarse_l500_r500
+  data_dir: data
+  out_dir: checkpoints/hpo_phase2/manual_baseline
+  log_file: null
+
+model:
+  chronos_model: autogluon/chronos-2-small
+  device: cuda:0
+  freeze_encoder: true
+  encoder_finetune_last_n: 0
+  use_embedding_cache: true
+  embedding_cache_storage: memmap
+  embedding_cache_dir: checkpoints/hpo_phase2/shared_cache_l500_r500
+  recompute_embedding_cache: false
+  cache_test_embeddings: false
+  context_length: 256
+  head_type: conv1d
+  encoder_num_variates: 12
+  head_hidden_dim: 256
+  head_num_layers: 2
+  head_dropout: 0.25
+  head_conv_channels: 256
+  head_conv_d_proj: 128
+  head_conv_kernel_size: 3
+  head_conv_num_layers: 2
+  head_lstm_hidden_dim: 256
+  head_lstm_num_layers: 1
+  encoder_output_trim: false
+
+window:
+  left_ms: 500
+  right_ms: 500
+  target_rate_hz: 100.0
+
+training:
+  epochs: 25
+  batch_size: 32
+  lr: 1.0e-4
+  lr_encoder: 1.0e-5
+  weight_decay: 0.05
+  num_workers: 4
+  seed: 42
+  loss_type: weighted_ce
+  class_weight_mode: inverse_sqrt
+  focal_gamma: 2.0
+  class_balance_beta: 0.9999
+
+early_stopping:
+  patience: 3
+  min_delta: 0.0001
+  early_stopping_metric: val_loss
+
+norm:
+  recompute_norm: false
+
+# Optuna (read only by train_stage1_hpo_optuna.py). train_stage1_chronos.py ignores this block.
+hpo:
+  enabled: true
+  study_name: stage1_phase2a_frozen_head
+  storage: sqlite:///checkpoints/hpo_phase2/optuna_phase2a.sqlite3
+  n_trials: 40
+  direction: minimize
+  metric: val_loss
+  pruner: median
+  pruner_n_startup_trials: 3
+  min_epochs_before_prune: 1
+  trial_out_root: checkpoints/hpo_phase2/trials_phase2a
+  # Optional: copy this file to each trial's out_dir as norm_stats.json before training (saves per-trial norm recompute).
+  norm_stats_seed: null
+  search:
+    lr: { type: log_float, low: 1.0e-5, high: 3.0e-4 }
+    weight_decay: { type: log_float, low: 1.0e-4, high: 0.15 }
+    head_dropout: { type: float, low: 0.05, high: 0.45 }
+    batch_size: { type: categorical, choices: [16, 32, 64] }
+    head_hidden_dim: { type: categorical, choices: [128, 256, 384] }
+    head_conv_channels: { type: categorical, choices: [128, 256, 384] }
+    head_conv_num_layers: { type: int, low: 1, high: 3 }
+    head_conv_kernel_size: { type: categorical, choices: [3, 5, 7] }

@@ -25,8 +25,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-rate-hz", type=float, default=100.0)
     p.add_argument(
         "--session-split-strategy",
-        choices=["session_random", "session_holdout"],
+        choices=["session_random", "session_holdout", "session_holdout_random_train_val"],
         default="session_random",
+    )
+    p.add_argument(
+        "--holdout-test-random-train-val",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use explicit --test-sessions as session-held-out test set, then random "
+        "train/val split by rows over all remaining non-test rows (respects --train-only-sessions).",
     )
     p.add_argument("--test-sessions", nargs="*", default=[])
     p.add_argument("--val-sessions", nargs="*", default=[])
@@ -71,12 +78,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    session_split_strategy = args.session_split_strategy
+    if args.holdout_test_random_train_val:
+        session_split_strategy = "session_holdout_random_train_val"
+
     cfg = Stage1ExportConfig(
         data_dir=args.data_dir,
         left_context_ms=args.left_ms,
         right_context_ms=args.right_ms,
         target_rate_hz=args.target_rate_hz,
-        session_split_strategy=args.session_split_strategy,  # type: ignore[arg-type]
+        session_split_strategy=session_split_strategy,  # type: ignore[arg-type]
         test_sessions=args.test_sessions,
         val_sessions=args.val_sessions,
         train_only_sessions=tuple(args.train_only_sessions),

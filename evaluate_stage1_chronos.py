@@ -170,17 +170,19 @@ def _print_random_sequence_predictions(
     base = collate_stack_lr_pad_batch(samples)
     x = normalize_mv(base["imu_mv"], mean, std)
     lengths = base["lengths"].to(device=device, dtype=torch.long)
-    x = pad_crop_temporal(x, context_length).to(device)
+    x = pad_crop_temporal(x, context_length)
     y = base["label_id"].to(device)
     bsz = int(x.shape[0])
 
     with torch.no_grad():
         if encoder_finetune_last_n > 0:
+            x_dev = x.to(device)
             set_encoder_finetune_train_mode(pipeline.model, encoder_finetune_last_n, training=False)
             stacked = chronos_encode_multivariate_grad(
-                pipeline, x.float(), context_length=context_length
+                pipeline, x_dev.float(), context_length=context_length
             ).to(device, dtype=torch.float32)
         else:
+            # Keep embed() input on CPU; Chronos embed internally handles batching/pin-memory.
             emb_list, _ = pipeline.embed(x.float(), batch_size=bsz, context_length=context_length)
             stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
         stacked = apply_stage1_encoder_trim(
@@ -314,18 +316,20 @@ def main() -> None:
 
     with torch.no_grad():
         for batch in loader:
-            imu = batch["imu_mv"].float().to(device)
+            imu_cpu = batch["imu_mv"].float()
             y = batch["label_id"].to(device)
             lengths = batch["lengths"].to(device=device, dtype=torch.long)
-            bsz = int(imu.shape[0])
+            bsz = int(imu_cpu.shape[0])
 
             if ft_n > 0:
+                imu = imu_cpu.to(device)
                 set_encoder_finetune_train_mode(pipeline.model, ft_n, training=False)
                 stacked = chronos_encode_multivariate_grad(
                     pipeline, imu, context_length=context_length
                 ).to(device, dtype=torch.float32)
             else:
-                emb_list, _ = pipeline.embed(imu, batch_size=bsz, context_length=context_length)
+                # Chronos embed() expects CPU tensors for its internal DataLoader/pin-memory path.
+                emb_list, _ = pipeline.embed(imu_cpu, batch_size=bsz, context_length=context_length)
                 stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
             stacked = apply_stage1_encoder_trim(
                 stacked,

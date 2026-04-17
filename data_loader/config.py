@@ -6,7 +6,11 @@ from typing import Literal, Optional, Sequence, Tuple
 SplitStrategy = Literal["LOSO", "LOPO", "random"]
 TargetVariant = Literal["raw_keystrokes", "clean_text", "clean_tokens"]
 RingsUsed = Literal["L", "R", "both"]
-SessionSplitStrategy = Literal["session_random", "session_holdout"]
+SessionSplitStrategy = Literal[
+    "session_random",
+    "session_holdout",
+    "session_holdout_random_train_val",
+]
 
 
 @dataclass
