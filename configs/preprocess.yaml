@@ -15,18 +15,34 @@ test_split: 0.1           # Fraction of sessions held out for testing
 seed: 42                  # Random seed for session shuffle
 
 # --------------------------------------------------------------------------- #
-#  Chronos encoder
+#  Encoder selection
 # --------------------------------------------------------------------------- #
-# Changing chronos_model also requires updating d_chronos in default.yaml.
+# Which time-series foundation model to use for encoding IMU windows.
+#   chronos — per-channel, variable-length sequence of token embeddings (S≈513
+#             for 10s @ 100Hz). Default.
+#   moment  — patch-based, fixed seq_len=512 (input resampled), returns
+#             n_patches=64 per-patch embeddings. Channels concatenated.
 #
+# Changing the encoder or its model size requires updating d_chronos
+# (the adapter input dim) in configs/default.yaml accordingly.
+encoder: "chronos"
+
+# --- Chronos ---
 #   Model                          embed_dim   d_chronos (both rings)   d_chronos (one ring)
 #   amazon/chronos-t5-tiny             32            384                     192
 #   amazon/chronos-t5-mini            128           1536                     768
 #   amazon/chronos-t5-small           256           3072                    1536
 #   amazon/chronos-t5-base            768           9216                    4608   ← default
 #   amazon/chronos-t5-large          1024          12288                    6144
-#
 chronos_model: "amazon/chronos-t5-base"
+
+# --- MOMENT ---
+#   Model                          d_model   d_enc (both rings)   d_enc (one ring)
+#   AutonLab/MOMENT-1-small           512         6144                 3072
+#   AutonLab/MOMENT-1-base            768         9216                 4608
+#   AutonLab/MOMENT-1-large          1024        12288                 6144   ← default
+moment_model: "AutonLab/MOMENT-1-large"
+
 batch_size: 32
 device: "cuda"
 
@@ -35,7 +51,7 @@ device: "cuda"
 # --------------------------------------------------------------------------- #
 ring: "both"              # Which ring(s) to encode: L, R, or both
 window_size: 10.0         # Sliding window duration in seconds
-step_size: 5.0            # Sliding window step size in seconds
+step_size: 2.0            # Sliding window step (default 2.0 — was 5.0; smaller step = ~2.5x more windows from same raw data)
 min_text_len: 5           # Minimum characters in a window to keep the sample
 target_hz: 100            # Target IMU sampling rate (Hz)
 no_normalize: false       # Set true to disable per-session per-channel z-score normalisation

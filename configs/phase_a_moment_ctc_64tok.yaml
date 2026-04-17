@@ -1,0 +1,62 @@
+# Phase A (MOMENT) — CTC + 64 soft tokens.
+#
+# Motivated by the resampler diagnostic: CTC on 32-token resampler_out gives
+# ctc_CER 0.791 vs 0.476 on 256-token proj_seq_up — 66% relative degradation
+# across the bottleneck. Doubling to 64 tokens should reduce compression loss
+# and lower val ctc_CER on resampler_out toward the 256-token bound.
+#
+# Cannot warm-start from a 32-token checkpoint (learned query dim differs).
+# Phase A is only ~5 min on MOMENT so training from scratch is fine.
+#
+# Usage:
+#   python train.py --config configs/phase_a_moment_ctc_64tok.yaml
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train_moment.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val_moment.pt"
+
+# --- Model (LLM disabled) ---
+skip_llm: true
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 12288
+n_soft_tokens: 64
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+lora_rank: 0
+
+# --- CTC head ---
+ctc_upsample_factor: 4
+char_ctc_weight: 0.3
+char_ctc_start: 0.1
+char_ctc_warmup_steps: 2000
+
+# --- Training ---
+epochs: 100
+batch_size: 32
+lr: 3.0e-4
+weight_decay: 0.05
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 1.0
+
+# --- Losses ---
+keystroke_weight: 1.0
+onset_weight: 1.0
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+save_dir: "./checkpoints/phase_a_moment_ctc_64tok"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 8

@@ -35,7 +35,13 @@ import torch
 import numpy as np
 import pandas as pd
 
-from utils.constants import IMU_COLS, CHRONOS_DEFAULT_MODEL, IMU_EPS
+from utils.constants import (
+    IMU_COLS,
+    CHRONOS_DEFAULT_MODEL,
+    MOMENT_DEFAULT_MODEL,
+    ENCODER_CHOICES,
+    IMU_EPS,
+)
 from utils.filename import parse_filename as _parse_filename
 from utils.imu_io import load_imu_csv as _load_imu_csv
 from utils.keystroke import (
@@ -45,6 +51,8 @@ from utils.keystroke import (
     post_process_text as _post_process_text,
 )
 from utils.chronos_encode import encode_with_chronos
+from utils.moment_encode import encode_with_moment
+from char_vocab import encode as char_encode
 
 
 def get_args() -> argparse.Namespace:
@@ -62,16 +70,26 @@ def get_args() -> argparse.Namespace:
                    help="Fraction of sessions held out for testing")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for session shuffle")
+    p.add_argument("--encoder", type=str, default="chronos", choices=list(ENCODER_CHOICES),
+                   help="Time-series foundation model used to encode IMU: "
+                        "'chronos' (per-channel, variable S) or 'moment' "
+                        "(patch-based, fixed seq_len=512 → S=64).")
     p.add_argument("--chronos_model", type=str, default=CHRONOS_DEFAULT_MODEL,
-                   help="Chronos model ID from HuggingFace")
+                   help="Chronos model ID from HuggingFace (used when --encoder chronos)")
+    p.add_argument("--moment_model", type=str, default=MOMENT_DEFAULT_MODEL,
+                   help="MOMENT model ID from HuggingFace (used when --encoder moment)")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--ring", type=str, default="both", choices=["L", "R", "both"],
                    help="Which ring(s) to encode. 'both' concatenates L+R channels.")
     p.add_argument("--window_size", type=float, default=10.0,
                    help="Sliding window duration in seconds")
-    p.add_argument("--step_size", type=float, default=5.0,
-                   help="Sliding window step size in seconds")
+    p.add_argument("--step_size", type=float, default=2.0,
+                   help="Sliding window step size in seconds (default 2.0 — was 5.0; "
+                        "smaller step yields more overlapping windows from the same data)")
+    p.add_argument("--raw_dirs", type=str, nargs="+", default=None,
+                   help="Optionally pass multiple raw directories to pool data from. "
+                        "When set, --raw_dir is ignored. Sessions across dirs are merged.")
     p.add_argument("--min_text_len", type=int, default=5,
                    help="Minimum characters in a window to create a sample")
     p.add_argument("--target_hz", type=int, default=100,
@@ -94,8 +112,8 @@ def get_args() -> argparse.Namespace:
             if key not in cli_argv:
                 setattr(args, key, value)
 
-    if args.raw_dir is None:
-        p.error("--raw_dir is required (or set raw_dir in your config file)")
+    if args.raw_dir is None and not getattr(args, "raw_dirs", None):
+        p.error("--raw_dir or --raw_dirs is required (or set raw_dir in your config file)")
 
     return args
 
@@ -232,8 +250,14 @@ def _load_raw_samples(
         ring_label = '+'.join(rings_to_use)
         print(f"  [{subject}_{session}] loading IMU ({ring_label}) + keystrokes...")
 
-        # Load keystroke events
-        events = _get_keystroke_events(_load_pkl(files['pkl']))
+        # Load keystroke events.
+        # `events` is the cleaned stream used for text reconstruction.
+        # `raw_events` keeps command-sequence chords (Cmd+X etc.) so the
+        # per-frame activity mask reflects every real motor event the ring
+        # sensed, not just the ones that produced printable characters.
+        pkl_dict = _load_pkl(files['pkl'])
+        events = _get_keystroke_events(pkl_dict)
+        raw_events = _get_keystroke_events(pkl_dict, clean=False)
         if len(events) < 5:
             print(f"  [{subject}_{session}] too few events, skipping")
             continue
@@ -256,6 +280,9 @@ def _load_raw_samples(
             t_end = t + window_size
 
             window_events = [e for e in events if t <= e['timestamp'] < t_end]
+            # Raw stream (includes Cmd/Ctrl+letter chords stripped from the
+            # cleaned `events`) — used only for the activity-mask intervals.
+            window_raw_events = [e for e in raw_events if t <= e['timestamp'] < t_end]
             if len(window_events) < 3:
                 t += step_size
                 continue
@@ -282,7 +309,24 @@ def _load_raw_samples(
             imu_combined = (np.concatenate(imu_arrays, axis=1)
                             if len(imu_arrays) > 1 else imu_arrays[0])
 
-            session_samples.append({'imu': imu_combined, 'text': text})
+            # Per-window keystroke-activity intervals as fractions of the window.
+            # These are resolution-agnostic; the encoder-length binary target is
+            # built post-encoding (see main()) once we know S.
+            intervals: list[tuple[float, float]] = []
+            for ev in window_raw_events:
+                ev_end = ev.get('end')
+                if ev_end is None:
+                    ev_end = ev['timestamp'] + 0.05  # ~50 ms default press duration
+                s_frac = max(0.0, (ev['timestamp'] - t) / window_size)
+                e_frac = min(1.0, (ev_end - t) / window_size)
+                if e_frac > s_frac:
+                    intervals.append((s_frac, e_frac))
+
+            session_samples.append({
+                'imu': imu_combined,
+                'text': text,
+                'keystroke_intervals': intervals,
+            })
             t += step_size
 
         samples[(subject, session)] = session_samples
@@ -340,23 +384,32 @@ def _split_sessions(
 def main():
     args = get_args()
 
-    session_map = _load_raw_samples(
-        raw_dir=args.raw_dir,
-        window_size=args.window_size,
-        step_size=args.step_size,
-        min_text_len=args.min_text_len,
-        ring=args.ring,
-        target_hz=args.target_hz,
-        normalize=not args.no_normalize,
-    )
+    raw_dirs = args.raw_dirs if getattr(args, "raw_dirs", None) else [args.raw_dir]
+    session_map: dict = {}
+    for rd in raw_dirs:
+        sub_map = _load_raw_samples(
+            raw_dir=rd,
+            window_size=args.window_size,
+            step_size=args.step_size,
+            min_text_len=args.min_text_len,
+            ring=args.ring,
+            target_hz=args.target_hz,
+            normalize=not args.no_normalize,
+        )
+        for k, v in sub_map.items():
+            if k in session_map:
+                print(f"  WARN: duplicate session key {k} (already loaded from a previous "
+                      f"raw_dir); skipping the copy from {rd}")
+                continue
+            session_map[k] = v
 
     if not session_map:
-        print("No samples found. Check --raw_dir and that CSV/PKL files are present.")
+        print("No samples found. Check --raw_dir / --raw_dirs and that CSV/PKL files are present.")
         return
 
     first = next(s for v in session_map.values() for s in v)
     n_channels = first["imu"].shape[1]
-    print(f"IMU channels per sample: {n_channels}  →  d_chronos = 768 * {n_channels} = {768 * n_channels}")
+    print(f"IMU channels per sample: {n_channels}  (encoder: {args.encoder})")
 
     train_raw, val_raw, test_raw = _split_sessions(
         session_map, args.val_split, args.test_split, args.seed
@@ -371,9 +424,45 @@ def main():
             print(f"  [{split_name}] no samples, skipping")
             encoded_splits[split_name] = []
             continue
-        encoded_splits[split_name] = encode_with_chronos(
-            raw_split, args.chronos_model, args.batch_size, args.device
+        if args.encoder == "chronos":
+            encoded = encode_with_chronos(
+                raw_split, args.chronos_model, args.batch_size, args.device
+            )
+        elif args.encoder == "moment":
+            encoded = encode_with_moment(
+                raw_split, args.moment_model, args.batch_size, args.device
+            )
+        else:
+            raise ValueError(f"Unknown encoder: {args.encoder}")
+        # encode_with_chronos drops fields it doesn't know about, so propagate
+        # keystroke_intervals from the raw split (same order, same length).
+        assert len(encoded) == len(raw_split), (
+            f"encoder returned {len(encoded)} samples for {len(raw_split)} inputs"
         )
+        for enc, raw in zip(encoded, raw_split):
+            S = enc["embeddings"].shape[0]
+            activity = torch.zeros(S, dtype=torch.uint8)
+            # Per-event onsets: mark only the starting frame of each event,
+            # regardless of whether overlapping events merge into a single run
+            # in the activity mask. This gives the onset head a per-keypress
+            # supervision signal instead of only tagging rising edges of the
+            # union mask (which would miss onsets of keys pressed while an
+            # earlier key is still held).
+            onset = torch.zeros(S, dtype=torch.uint8)
+            for s_frac, e_frac in raw["keystroke_intervals"]:
+                lo = max(0, int(s_frac * S))
+                hi = min(S, int(np.ceil(e_frac * S)))
+                if hi > lo:
+                    activity[lo:hi] = 1
+                    onset[min(S - 1, lo)] = 1
+            enc["keystroke_active"] = activity
+            enc["keystroke_onset"] = onset
+            # Character-level CTC targets. Computed once per sample here so
+            # train.py doesn't re-encode every batch.
+            enc["char_targets"] = torch.tensor(
+                char_encode(enc["text"]), dtype=torch.long
+            )
+        encoded_splits[split_name] = encoded
 
     # Mean-center Chronos embeddings using training-set statistics.
     # Subtracting the mean removes the shared "background" direction that
@@ -388,10 +477,33 @@ def main():
             for s in split_samples:
                 s["embeddings"] = (s["embeddings"].float() - train_mean).to(s["embeddings"].dtype)
 
+    # Report keystroke-activity and onset rates so issues with the binary
+    # targets (all-zero or all-one) surface immediately.
     for split_name, split_samples in encoded_splits.items():
         if not split_samples:
             continue
-        out_path = output_dir / f"{split_name}.pt"
+        rates = torch.stack([s["keystroke_active"].float().mean()
+                             for s in split_samples])
+        print(f"  [{split_name}] keystroke-activity rate: "
+              f"mean={rates.mean():.3f}  min={rates.min():.3f}  max={rates.max():.3f}")
+        onset_rates = torch.stack([s["keystroke_onset"].float().mean()
+                                    for s in split_samples])
+        print(f"  [{split_name}] keystroke-onset    rate: "
+              f"mean={onset_rates.mean():.4f}  min={onset_rates.min():.4f}  max={onset_rates.max():.4f}")
+        char_lens = [s["char_targets"].numel() for s in split_samples]
+        if char_lens:
+            import statistics as _st
+            print(f"  [{split_name}] char-target length: "
+                  f"L_mean={_st.mean(char_lens):.1f}  L_max={max(char_lens)}  "
+                  f"L_min={min(char_lens)}")
+
+    # Suffix non-default encoders into the filename so MOMENT embeddings don't
+    # clobber Chronos ones in the same output_dir.
+    suffix = "" if args.encoder == "chronos" else f"_{args.encoder}"
+    for split_name, split_samples in encoded_splits.items():
+        if not split_samples:
+            continue
+        out_path = output_dir / f"{split_name}{suffix}.pt"
         torch.save(split_samples, str(out_path))
         print(f"Saved {len(split_samples)} {split_name} samples to {out_path}")
 

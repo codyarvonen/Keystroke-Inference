@@ -53,7 +53,7 @@ def encode_with_chronos(
     pipeline = ChronosPipeline.from_pretrained(
         model_name,
         device_map=device,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
     )
     results = []
     for i in range(0, len(samples), batch_size):

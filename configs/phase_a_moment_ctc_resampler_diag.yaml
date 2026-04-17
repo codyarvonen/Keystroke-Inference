@@ -1,0 +1,62 @@
+# Diagnostic: Phase A (MOMENT) with CTC attached to the 32 compressed resampler
+# tokens instead of the 256-token upsampled proj_seq.
+#
+# Purpose: directly measure how much character information survives the perceiver
+# bottleneck. If ctc_CER plateaus near 1.0 here while phase_a_moment_ctc.yaml
+# reaches ~0.47, the 32-token resampler is confirmed as the structural block
+# discarding character content. That finding justifies increasing n_soft_tokens.
+#
+# Usage:
+#   python train.py --config configs/phase_a_moment_ctc_resampler_diag.yaml
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train_moment.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val_moment.pt"
+
+# --- Model (LLM disabled) ---
+skip_llm: true
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 12288
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+lora_rank: 0
+
+# --- CTC head on resampler_out (32 tokens) ---
+ctc_upsample_factor: 1   # irrelevant — ctc_on_resampler bypasses upsample
+ctc_on_resampler: true
+char_ctc_weight: 0.3
+char_ctc_start: 0.1
+char_ctc_warmup_steps: 2000
+
+# --- Training ---
+epochs: 100
+batch_size: 32
+lr: 3.0e-4
+weight_decay: 0.05
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 1.0
+
+# --- Losses ---
+keystroke_weight: 1.0
+onset_weight: 1.0
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+# --- Logging / saving ---
+save_dir: "./checkpoints/phase_a_moment_ctc_resampler_diag"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 8

@@ -10,7 +10,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
-from adapter import IMUAdapter
+from adapter import IMUAdapter, KeystrokeHead, CharCTCHead, CharSeq2SeqDecoder
+from char_vocab import VOCAB_SIZE as CHAR_VOCAB_SIZE
 
 
 class RingToText(nn.Module):
@@ -54,36 +55,79 @@ class RingToText(nn.Module):
         lora_target_modules: list[str] | None = None,
         adapter_dim: int = 256,
         adapter_dropout: float = 0.5,
+        use_keystroke: bool = True,
+        skip_llm: bool = False,
+        use_char_ctc: bool = False,
+        ctc_upsample_factor: int = 1,
+        ctc_on_resampler: bool = False,
+        ctc_no_cross_attn: bool = False,
+        freeze_resampler: bool = False,
+        use_char_seq2seq: bool = False,
     ):
         super().__init__()
+        self.skip_llm = skip_llm
+        self.use_keystroke = use_keystroke
+        self.use_char_ctc = use_char_ctc
+        self.ctc_upsample_factor = ctc_upsample_factor
+        self.ctc_on_resampler = ctc_on_resampler
+        self.ctc_no_cross_attn = ctc_no_cross_attn
+        self.freeze_resampler = freeze_resampler
+        self.use_char_seq2seq = use_char_seq2seq
 
-        # --- Frozen LLM ---
-        self.tokenizer = AutoTokenizer.from_pretrained(llm_name)
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # --- LLM (skipped entirely in Phase A to save GPU memory) ---
+        if not skip_llm:
+            self.tokenizer = AutoTokenizer.from_pretrained(llm_name)
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            llm_name, dtype=dtype
-        )
-        for p in self.llm.parameters():
-            p.requires_grad = False
-
-        self.lora_enabled = lora_rank > 0
-        if self.lora_enabled:
-            targets = lora_target_modules or self._default_lora_targets(llm_name)
-            lora_cfg = LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=targets,
-                bias="none",
-                task_type="CAUSAL_LM",
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                llm_name, torch_dtype=dtype
             )
-            self.llm = get_peft_model(self.llm, lora_cfg)
-            self.llm = self.llm.to(dtype)  # cast LoRA A/B to bfloat16 to match base model
-        self.llm.eval()  # base dropout stays deterministic; LoRA grads still flow
+            for p in self.llm.parameters():
+                p.requires_grad = False
 
-        d_llm = self.llm.config.hidden_size
+            self.lora_enabled = lora_rank > 0
+            if self.lora_enabled:
+                targets = lora_target_modules or self._default_lora_targets(llm_name)
+                lora_cfg = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
+                    target_modules=targets,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+                self.llm = get_peft_model(self.llm, lora_cfg)
+                self.llm = self.llm.to(dtype)  # cast LoRA A/B to bfloat16 to match base model
+            self.llm.eval()  # base dropout stays deterministic; LoRA grads still flow
+            d_llm = self.llm.config.hidden_size
+        else:
+            self.tokenizer = None
+            self.llm = None
+            self.lora_enabled = False
+            # Even with the LLM skipped, pull d_llm from the target model's
+            # config so Phase A's adapter.out_proj matches Phase B's shape.
+            # Using a placeholder (e.g. 256) would make the Phase B
+            # strict-load of the Phase A checkpoint crash on the out_proj
+            # weight shape mismatch.
+            #
+            # Fallback table lets Phase A run fully offline (no HF cache hit)
+            # for known model families — the previous placeholder behaviour
+            # was offline-friendly and we don't want to regress that.
+            _KNOWN_HIDDEN = {
+                "qwen/qwen2.5-1.5b": 1536,
+                "qwen/qwen2.5-0.5b": 896,
+                "qwen/qwen2.5-3b": 2048,
+                "gpt2": 768,
+                "gpt2-medium": 1024,
+                "gpt2-large": 1280,
+            }
+            key = llm_name.lower()
+            if key in _KNOWN_HIDDEN:
+                d_llm = _KNOWN_HIDDEN[key]
+            else:
+                from transformers import AutoConfig
+                d_llm = AutoConfig.from_pretrained(llm_name).hidden_size
 
         # --- Trainable adapter ---
         self.adapter = IMUAdapter(
@@ -93,13 +137,55 @@ class RingToText(nn.Module):
             adapter_dim=adapter_dim,
             n_resampler_layers=n_resampler_layers,
             dropout=adapter_dropout,
+            ctc_upsample_factor=ctc_upsample_factor,
         )
         # Cast adapter to same dtype as LLM for mixed-precision consistency
         self.adapter = self.adapter.to(dtype)
 
+        # Phase B LoRA runs may want to hold the Phase-A grounded adapter
+        # rhythm in place while the LLM adjusts. We leave out_proj trainable
+        # because LoRA-induced distribution shift may need small rescaling
+        # into LLM space.
+        if freeze_resampler:
+            for p in self.adapter.proj.parameters():
+                p.requires_grad = False
+            for p in self.adapter.resampler.parameters():
+                p.requires_grad = False
+
+        # --- Keystroke head (binary frame-level activity detector) ---
+        # Kept in fp32: this is the only path delivering dense gradient to
+        # the adapter in Phase A, so we want full-precision master weights
+        # even though autocast still runs the forward in bf16.
+        self.keystroke_head = (
+            KeystrokeHead(adapter_dim, dropout=adapter_dropout)
+            if use_keystroke
+            else None
+        )
+
+        # --- Character CTC head (dense content supervision) ---
+        self.char_ctc_head = (
+            CharCTCHead(adapter_dim, vocab_size=CHAR_VOCAB_SIZE, dropout=adapter_dropout)
+            if use_char_ctc
+            else None
+        )
+
+        # --- Character seq2seq head (cross-attn decoder on 32 soft tokens) ---
+        # Unlike CTC, has no T≥L length constraint: the 32 tokens are treated
+        # as compressed memory and can be queried at each decode step.
+        self.char_seq2seq_head = (
+            CharSeq2SeqDecoder(
+                adapter_dim=adapter_dim,
+                vocab_size=CHAR_VOCAB_SIZE,
+                dropout=adapter_dropout,
+            )
+            if use_char_seq2seq
+            else None
+        )
+
         # --- Prompt prefix ---
         self.prompt_text = prompt or self.DEFAULT_PROMPT
-        self._register_prompt_embeds()
+        if not skip_llm:
+            self._register_prompt_embeds()
 
     # --------------------------------------------------------------------- #
     #  Prompt embedding cache
@@ -152,25 +238,63 @@ class RingToText(nn.Module):
     def forward(
         self,
         chronos_embeds: torch.Tensor,
-        target_ids: torch.Tensor,
+        target_ids: torch.Tensor | None = None,
         chronos_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        char_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
-        Training forward pass with teacher-forced cross-entropy loss.
+        Training forward pass.
+
+        With `skip_llm=True` (Phase A) only the adapter + keystroke head run —
+        the LLM is not loaded and there is no LM loss. With `skip_llm=False`
+        (Phase B) both the LM cross-entropy and the keystroke logits are
+        produced.
 
         Args:
             chronos_embeds: (B, S_enc, d_chronos) — frozen Chronos output
-            target_ids:     (B, S_text)           — token IDs for teacher-forced input
+            target_ids:     (B, S_text)           — LLM token IDs (ignored if skip_llm)
             chronos_mask:   (B, S_enc)            — True for padded encoder positions
-            labels:         (B, S_text)           — loss targets; pad positions set to
-                                                    -100 so EOS is not silently masked
-                                                    (falls back to target_ids if None)
+            labels:         (B, S_text)           — LM loss targets; pad positions = -100
 
         Returns:
-            dict with 'loss' and 'logits'
+            dict with any of: 'loss', 'logits', 'soft_tokens', 'resampler_out',
+            'projected_mean', 'keystroke_logits'
         """
-        soft_tokens, resampler_out, projected_mean = self.adapter(chronos_embeds, chronos_mask)
+        soft_tokens, resampler_out, projected_mean, proj_seq, proj_seq_up = self.adapter(
+            chronos_embeds, chronos_mask
+        )
+
+        out: dict[str, torch.Tensor] = {
+            "soft_tokens": soft_tokens,
+            "resampler_out": resampler_out,
+            "projected_mean": projected_mean,
+        }
+
+        if self.keystroke_head is not None:
+            activity_logits, onset_logits = self.keystroke_head(proj_seq, resampler_out)
+            out["keystroke_logits"] = activity_logits
+            out["onset_logits"] = onset_logits
+
+        if self.char_ctc_head is not None:
+            if self.ctc_on_resampler:
+                # Diagnostic: run CTC on the 32 compressed soft tokens to
+                # measure how much character info survives resampler bottleneck.
+                out["char_logits"] = self.char_ctc_head(resampler_out, None)
+            elif self.ctc_no_cross_attn:
+                # Ablation: CTC on proj_seq_up with no cross-attn to resampler.
+                # Tests whether the diffuse-KV hypothesis explains the 64-token
+                # regression (more KV tokens → worse per-frame character gradient).
+                out["char_logits"] = self.char_ctc_head(proj_seq_up, None)
+            else:
+                out["char_logits"] = self.char_ctc_head(proj_seq_up, resampler_out)
+
+        if self.char_seq2seq_head is not None and char_ids is not None:
+            out["char_seq2seq_logits"] = self.char_seq2seq_head(resampler_out, char_ids)
+
+        if self.skip_llm or target_ids is None:
+            return out
+
         combined, n_prefix = self._build_inputs(soft_tokens, target_ids)
 
         # NOTE: do NOT wrap in torch.no_grad() here — gradients must flow
@@ -189,13 +313,9 @@ class RingToText(nn.Module):
             ignore_index=-100,
         )
 
-        return {
-            "loss": loss,
-            "logits": text_logits,
-            "soft_tokens": soft_tokens,
-            "resampler_out": resampler_out,
-            "projected_mean": projected_mean,
-        }
+        out["loss"] = loss
+        out["logits"] = text_logits
+        return out
 
     # --------------------------------------------------------------------- #
     #  Generation (inference)
@@ -216,7 +336,7 @@ class RingToText(nn.Module):
 
         Returns a list of decoded strings (one per batch element).
         """
-        soft_tokens, _, _ = self.adapter(chronos_embeds, chronos_mask)
+        soft_tokens, _, _, _, _ = self.adapter(chronos_embeds, chronos_mask)
         combined, _ = self._build_inputs(soft_tokens)
 
         # Prepare stop token
@@ -283,15 +403,76 @@ class RingToText(nn.Module):
 
     def save_adapter(self, path: str):
         ckpt = {"adapter": self.adapter.state_dict()}
+        if self.keystroke_head is not None:
+            ckpt["keystroke_head"] = self.keystroke_head.state_dict()
+        if self.char_ctc_head is not None:
+            ckpt["char_ctc_head"] = self.char_ctc_head.state_dict()
+        if self.char_seq2seq_head is not None:
+            ckpt["char_seq2seq_head"] = self.char_seq2seq_head.state_dict()
         if self.lora_enabled:
             ckpt["lora"] = get_peft_model_state_dict(self.llm)
         torch.save(ckpt, path)
 
     def load_adapter(self, path: str, **kwargs):
+        """
+        Load adapter weights (and optional keystroke head / LoRA) from disk.
+
+        Checkpoints from the legacy CTC iteration carry a `ctc_head` key with
+        a different output dim; we ignore it with a warning so that the
+        adapter weights still transfer cleanly.
+        """
+        import logging
+        log = logging.getLogger("ring2text")
+
         raw = torch.load(path, **kwargs)
         if isinstance(raw, dict) and "adapter" in raw:
-            # New combined format
-            self.adapter.load_state_dict(raw["adapter"])
+            # strict=False because ctc_upsample may or may not be present in
+            # either side (Phase A no-CTC checkpoint vs. Phase B CTC model, etc.)
+            missing_a, unexpected_a = self.adapter.load_state_dict(
+                raw["adapter"], strict=False,
+            )
+            if missing_a or unexpected_a:
+                log.warning(
+                    "[load_adapter] adapter partially loaded from %s "
+                    "(missing=%d, unexpected=%d). Typically the ctc_upsample "
+                    "layer: present in one model but not the other.",
+                    path, len(missing_a), len(unexpected_a),
+                )
+            if self.char_ctc_head is not None and "char_ctc_head" in raw:
+                self.char_ctc_head.load_state_dict(
+                    raw["char_ctc_head"], strict=False,
+                )
+            if self.char_seq2seq_head is not None and "char_seq2seq_head" in raw:
+                self.char_seq2seq_head.load_state_dict(
+                    raw["char_seq2seq_head"], strict=False,
+                )
+            if self.keystroke_head is not None and "keystroke_head" in raw:
+                # Checkpoints from the single-head KeystrokeHead iteration
+                # (activity only, with a depthwise temporal conv) have a
+                # different state-dict shape. Use strict=False so the
+                # current shared trunk loads whatever overlapping weights
+                # exist (q_norm, kv_norm, cross_attn, norm) and the two
+                # fresh classifier heads + removed conv are simply
+                # reinitialised. This is intentional — the old architecture
+                # is being replaced to fix the onset-F1 ceiling.
+                missing, unexpected = self.keystroke_head.load_state_dict(
+                    raw["keystroke_head"], strict=False,
+                )
+                if missing or unexpected:
+                    log.warning(
+                        "[load_adapter] keystroke_head partially loaded from %s "
+                        "(missing=%d, unexpected=%d). This is expected when "
+                        "moving from the legacy single-head design to the new "
+                        "dual-head (activity + onset) head.",
+                        path, len(missing), len(unexpected),
+                    )
+            if "ctc_head" in raw:
+                log.warning(
+                    "[load_adapter] checkpoint %s contains a legacy 'ctc_head' "
+                    "from the character-CTC iteration; ignoring it. Keystroke "
+                    "head (if present) will start from random init.",
+                    path,
+                )
             if "lora" in raw and self.lora_enabled:
                 set_peft_model_state_dict(self.llm, raw["lora"])
         else:

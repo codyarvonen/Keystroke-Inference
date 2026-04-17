@@ -1,0 +1,58 @@
+# Phase A (Chronos) — keystroke activity + onset + character-CTC supervision.
+#
+# Chronos' per-channel encoding yields S~=513 per window, so CTC has natural
+# temporal headroom and the upsample factor stays at 1. batch_size=16 because
+# Chronos sequences are much longer than MOMENT's 64 patches.
+#
+# Usage:
+#   python train.py --config configs/phase_a_chronos_ctc.yaml
+
+# --- Data ---
+data_dir: null
+data_file: "./embeddings/train.pt"
+val_data_dir: null
+val_data_file: "./embeddings/val.pt"
+
+# --- Model (LLM disabled) ---
+skip_llm: true
+no_keystroke: false
+llm: "Qwen/Qwen2.5-1.5B"
+d_chronos: 9216
+n_soft_tokens: 32
+n_resampler_layers: 2
+adapter_dim: 256
+adapter_dropout: 0.1
+lora_rank: 0
+
+# --- CTC head ---
+ctc_upsample_factor: 1
+char_ctc_weight: 0.3
+char_ctc_start: 0.1
+char_ctc_warmup_steps: 2000
+
+# --- Training ---
+epochs: 100
+batch_size: 16
+lr: 3.0e-4
+weight_decay: 0.05
+warmup_steps: 200
+grad_accum: 1
+max_text_len: 64
+max_grad_norm: 1.0
+
+# --- Losses ---
+keystroke_weight: 1.0
+onset_weight: 1.0
+onset_focal_gamma: 2.0
+onset_focal_alpha: 0.75
+div_weight: 0.0
+recon_weight: 0.0
+contrast_weight: 0.0
+contrast_temp: 0.1
+
+save_dir: "./checkpoints/phase_a_chronos_ctc"
+log_every: 50
+val_every: 500
+save_every: 1000
+n_generate_samples: 5
+patience: 8

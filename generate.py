@@ -103,7 +103,11 @@ def main():
         adapter_dim=args.adapter_dim,
     ).to(device)
 
-    model.load_adapter(args.adapter_path, map_location=device, weights_only=True)
+    # Adapter checkpoints are dicts of tensors ({"adapter", "keystroke_head",
+    # optional "lora"}); on torch >= 2.4 the restrictive weights_only=True
+    # default rejects the nested PEFT metadata inside the LoRA state, so we
+    # load the checkpoint in full-pickle mode (matching training's save path).
+    model.load_adapter(args.adapter_path, map_location=device, weights_only=False)
     model.eval()
     print(f"Adapter loaded from {args.adapter_path}")
 

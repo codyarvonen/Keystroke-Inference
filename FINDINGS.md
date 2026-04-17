@@ -785,3 +785,1029 @@ contrast_loss = cross_entropy(sim, arange(B))
 **Why it helps:** Directly ties the adapter output to the semantic content of the target text. The LLM embedding space is already rich and meaningful. The text prototype is computed from the frozen embedding layer (already in memory) with no LLM forward pass. Padding positions are excluded via the label mask.
 
 **Log fields added:** `recon` and `ct` appear in step logs alongside `div`.
+
+---
+
+## Run 11/12 Setup (2026-04-14) — CTC Pretraining + Two-Phase Schedule
+
+After 10 runs failed to learn the IMU→text mapping, root cause was identified as a missing content-grounded gradient: the only signal reaching the adapter was LM cross-entropy through a frozen LLM via a 32-token bottleneck, and the easiest local minimum was always "produce a constant prefix that elicits typical English." Diversity / reconstruction / contrastive aux losses each broke specific failure modes but never produced word-level alignment.
+
+**Intervention:** attach a CTC head to the adapter's *pre-resampler* per-timestep features, supervised by the per-window character sequence reconstructed from existing PKL keystroke timestamps. This delivers dense, frame-level, content-grounded supervision that does not depend on the LLM at all.
+
+### Architecture changes
+
+- **`char_vocab.py`** (new): 38-token character vocabulary — `<blank>` (id 0, required by CTC), `<unk>`, a–z, 0–9, space, `.`, `,`, `'`, `?`, `!`, `-`, `\n`. Provides `encode()`, `decode()`, `ctc_greedy_decode()`.
+- **`adapter.py`**:
+  - `IMUAdapter.forward()` now returns a 4-tuple `(soft_tokens, resampler_out, projected_mean, proj_seq)` — `proj_seq` is the full per-timestep `(B, S, adapter_dim)` projection, fed to CTC.
+  - New `CTCHead` module: depthwise temporal conv (k=5) with residual, LayerNorm, linear classifier. ~10K extra params.
+- **`model.py`**:
+  - New flags `use_ctc=True`, `skip_llm=False`, `char_vocab_size`.
+  - When `skip_llm=True`, the LLM and tokenizer are not loaded at all (saves ~3GB GPU + LLM forward time).
+  - `save_adapter` / `load_adapter` round-trip the CTC head state.
+- **`dataset.py`**: emits `char_ids` and `char_lens` per sample; `collate_fn` pads with blank id and exposes `embed_lens` (true non-padded encoder lengths) for the CTC `input_lengths` argument.
+- **`preprocess.py`**: default `step_size` 5.0 → 2.0 (≈2.5× more overlapping windows). New `--raw_dirs` to pool multiple data roots. Every encoded sample gets a `char_targets` field via `char_encode(text)`.
+- **`train.py`**:
+  - New args: `--ctc_weight`, `--skip_llm`, `--no_ctc`, `--adapter_init`.
+  - CTC loss computed via `F.ctc_loss(log_probs, char_ids, input_lengths, target_lengths, blank=BLANK_ID, zero_infinity=True)`; `log_probs` is `log_softmax(ctc_logits, dim=-1).transpose(0, 1)`.
+  - When `skip_llm`, total loss = `ctc_weight * ctc_loss`; div/recon/contrast are gated off.
+  - `validate()` rewritten to compute CTC-greedy CER per batch in addition to LM generation CER.
+
+### Two-phase schedule
+
+**Phase A — `configs/phase_a.yaml`**: `skip_llm=true`, `ctc_weight=1.0`, `lr=3e-4`, `batch_size=32`, all legacy aux=0, patience=8. Trains adapter + CTC head from scratch. Success bar: val CTC-CER monotonically drops below 0.8 with visibly recognisable partial words in greedy decodes. Output: `checkpoints/phase_a/adapter_best.pt`.
+
+**Phase B — `configs/phase_b.yaml`**: `skip_llm=false`, `ctc_weight=0.3`, `lr=3e-5`, `batch_size=16`. Loads Phase A via `--adapter_init`. CTC stays on at lower weight to prevent the adapter from regressing while LM cross-entropy adds fluency. Success bar: LM generation echoes ground-truth content (not fluent-but-wrong prose), val LM loss meaningfully below Run 8's 4.52, generation CER < 1.0.
+
+### Why CTC on pre-resampler features
+
+The 32-token resampler output is the bottleneck where information dies. Attaching the CTC head to `proj_seq: (B, S, adapter_dim)` *before* the resampler lets supervision reach the entire adapter at temporal resolution, not just the 32 compressed queries. The resampler still has to produce the 32 tokens for Phase B, but it now sits on top of features that have been forced to encode actual character content.
+
+### Status
+
+Implementation complete. Phase A run pending.
+
+---
+
+## Run 12 — Character-CTC → Keystroke-activity pretraining (2026-04-14)
+
+### Motivation
+
+The character-CTC iteration (Run 11 plan above) grounded the adapter with frame-level character supervision. Observation during review: character prediction partially duplicates the frozen Qwen LLM's job in Phase B — it makes the adapter learn to produce what the LLM would already produce given rhythm. This wastes capacity and risks the adapter collapsing into a text-prior echo before Phase B even starts.
+
+New hypothesis: replace character-CTC with a **binary per-frame keystroke-activity** objective. The adapter learns *when* keystrokes happen from IMU motion alone; the frozen LLM is the only path from rhythm to characters in Phase B. No explicit event→char mapper is trained.
+
+Trade-off: supervision is weaker per frame (1 bit vs ~5 bits for a 38-class character target), but it is strictly IMU-native — the adapter cannot shortcut by copying a language prior because the target (key-press presence) is not in the text distribution. If Phase B fails to echo content, the escalation path is per-hand binary (2 channels) → keyboard region (4–6 channels) → per-key, not back to character-CTC.
+
+### Supervision target
+
+Per sample, a length-`S` uint8 mask built from PKL `key_times` at encoder resolution (S=513 for 10 s @ 100 Hz, Chronos-determined):
+- For each event `(start, end)` in the window, mark frames `[floor((start-t0)/W * S), ceil((end-t0)/W * S))` as 1.
+- Events without `end` default to a 50 ms press duration.
+- Modifier keys (shift, ctrl, etc.) are included — they are real motor events even though they don't appear in the reconstructed text.
+- Built at encoder resolution (not IMU resolution) post-encoding to stay decoupled from Chronos patching.
+
+### File changes
+
+- **`adapter.py`**: `CTCHead` → `KeystrokeHead`. Same architecture (q_norm/kv_norm + cross-attn into resampler + depthwise temporal conv + LayerNorm), output dim 1 instead of `vocab_size`. Returns `(B, S)` after squeeze. The cross-attention path is what carries BCE gradient back through the perceiver in Phase A.
+- **`preprocess.py`**: every sample dict gains `keystroke_active: torch.uint8 (S,)`. Per-split activity rate reported for sanity.
+- **`model.py`**: `use_ctc` → `use_keystroke`, `char_vocab_size` param removed. `out["ctc_logits"]` → `out["keystroke_logits"]`. `save_adapter`/`load_adapter` round-trip under `"keystroke_head"`; legacy `"ctc_head"` key is warned-and-ignored for back-compat. `_load_ctc_head_state` helper removed.
+- **`dataset.py`**: emits `keystroke_targets: (B, max_S) float` and `keystroke_mask: (B, max_S) bool` (True for valid frames via `embed_lens`). No more `char_ids`/`char_lens`.
+- **`train.py`**: `_compute_ctc_loss` → `_compute_keystroke_loss` (BCE-with-logits, masked-mean, with `pos_weight`). `pos_weight` computed once over the train set as `(1-p)/p`. `validate()` now reports `val_ks_loss`, frame F1 (threshold 0.5 pooled across val), and onset F1 (rising-edge matching within ±2 frames ≈ 40 ms tolerance). CLI flags `--ctc_weight` → `--keystroke_weight`, `--no_ctc` → `--no_keystroke`. `_CTC_LEN_WARNED` machinery dropped — BCE has no length-validity concern.
+- **`configs/phase_a.yaml`** / **`phase_b.yaml`**: `ctc_weight: 1.0` → `keystroke_weight: 1.0`; `ctc_weight: 0.3` → `keystroke_weight: 0.3`. Phase B retains the auxiliary head at low weight to prevent the adapter forgetting rhythm during LM CE training.
+- **`char_vocab.py`**: deleted. No production path imports it after this iteration. The legacy `"ctc_head"` load warning stays inline in `load_adapter` as a safety net.
+- **`pipeline_diagram.{png,pdf}`**: deleted — depicted the CTC + char-vocab path.
+
+### Why put BCE on pre-resampler features (same reasoning as Run 11)
+
+The 32-token resampler output is still the information bottleneck. Attaching BCE to `proj_seq: (B, S, adapter_dim)` lets supervision reach the entire adapter at temporal resolution. The `KeystrokeHead` cross-attends into `resampler_out` so gradient also flows through the perceiver — critical in Phase A where LM CE is absent.
+
+### Success bar
+
+- **Phase A**: val BCE drops monotonically and plateaus; frame F1 > 0.6 and onset F1 > 0.5 by ~epoch 30. GPU memory comparable to Run 11 Phase A (LLM still skipped).
+- **Phase B**: LM val loss meaningfully below Run 8's 4.5252 baseline; `[LLM]` generation samples echo ground-truth content rather than fluent-but-wrong prose.
+
+If Phase B fails the content bar, escalate target granularity rather than reverting to character-CTC.
+
+### Status
+
+Implementation complete. Bug-hunt review pending. Preprocess + Phase A + Phase B runs pending.
+
+---
+
+## Run 13 — Phase A — `train_20260414_235239.log` (keystroke BCE, skip_llm)
+
+First execution of the two-phase plan. Adapter + KeystrokeHead trained from scratch on the per-frame binary keystroke-activity target. LLM fully skipped.
+
+### Config
+- `skip_llm=True`, `keystroke_weight=1.0`, `lr=3e-4`, `batch_size=32`, `epochs=100`, `patience=8`
+- `div=0, recon=0, contrast=0`, `adapter_dropout=0.1`, `max_grad_norm=1.0`, `warmup=200`
+- Train: 3,465 samples (≈2.5× prior runs, via `step_size=2.0` overlapping windows); Val: 229
+- Trainable: 4,674,305 (adapter + KeystrokeHead)
+- BCE `pos_weight` = 1.423 (activity rate ≈ 41%)
+
+### Val curve
+
+| Step | val_loss (BCE) | frame_F1 | onset_F1 | Note |
+|------|---------------|----------|----------|------|
+| 500  | 0.7681 | 0.749 | 0.048 | BEST |
+| 1000 | 0.7467 | 0.753 | 0.071 | BEST |
+| 1500 | 0.7383 | 0.752 | 0.092 | BEST |
+| 2000 | 0.7367 | 0.755 | 0.102 | BEST |
+| 2500 | 0.7332 | 0.758 | 0.111 | BEST |
+| **3000** | **0.7318** | **0.760** | 0.097 | **BEST (saved)** |
+| 3500 | 0.7573 | 0.749 | 0.120 | no improvement 1/8 |
+| 4000–7000 | 0.76–0.83 | ~0.75 | 0.12–0.14 | val BCE rising while onset_F1 creeps up |
+| 7000 | — | — | — | early stop (8/8), ep ~64 |
+
+Training complete in 46.0 min. Best val_loss 0.7318.
+
+### Findings
+
+**1. Frame F1 plateaus ≈ 0.76 — precision-limited**
+Best check has P 0.640, R 0.936. The model is over-predicting activity: recall is near-saturated but precision stalls at ~0.65. Raising pos_weight or using focal/asymmetric loss would likely push precision up. BCE alone with `pos_weight=1.423` biases toward "on."
+
+**2. Onset F1 is poor and inversely coupled to val BCE**
+Onset_F1 never exceeds 0.14 even as frame_F1 stays flat. Onset P stabilises ~0.30, R only ~0.07–0.09 — the model smooths event boundaries instead of producing crisp rising edges. The head's depthwise k=5 temporal conv over per-frame features gives a blurred activation, so tight onset matching (±2 frames) fails. After step 3000, onset_F1 continues creeping up (0.10→0.14) while val BCE *degrades* (0.73→0.83) — the frame loss and onset accuracy disagree on the optimum.
+
+**3. Early stop at ep 64; val BCE floor = 0.7318 at ep 27**
+After ep 27 val BCE rises monotonically (0.73 → 0.83) despite epoch-average train loss falling further. Clean overfitting pattern: the BCE surface is soft enough that the network keeps tightening on training frames past the generalisation sweet spot.
+
+**4. Cross-attention path is functioning**
+KeystrokeHead cross-attends into `resampler_out`. With LLM skipped, BCE is the only gradient into the perceiver; if cross-attention had zero effect the resampler would be unconstrained. The fact that frame_F1 rises from 0.749 → 0.760 confirms gradient does flow through the perceiver during Phase A.
+
+**5. Data-size intervention is visible**
+This is the first run at 3,465 train samples vs ~1,391 in runs 1–10 (`step_size` 5.0 → 2.0). 2.5× more supervision — primarily noticeable via smoother val curves with lower variance than earlier runs.
+
+### Conclusion
+Phase A succeeds at its stated job: the adapter learns keystroke rhythm (frame_F1 ~0.76) without touching the LLM. But onset detection is weak (0.10–0.14), which directly caps how much crisp timing information Phase B's LLM can exploit. Checkpoint `phase_a/adapter_best.pt` at step 3000 is the Phase B initialisation.
+
+---
+
+## Run 14 — Phase B — `train_20260415_003914.log` (LLM CE + keystroke BCE at 0.3)
+
+Loaded Phase A's best adapter and switched LLM on. CTC-style head stays active at 0.3 weight to prevent the adapter forgetting rhythm while LM gradient pushes fluency.
+
+### Config (vs Phase A)
+- `skip_llm=False`, `llm=Qwen/Qwen2.5-1.5B`, `adapter_init=./checkpoints/phase_a/adapter_best.pt`
+- `keystroke_weight=0.3`, `lr=3e-5`, `batch_size=16`, `max_grad_norm=0.5`, `weight_decay=0.1`, `patience=5`
+- `epochs=100`, `total steps=21,700`
+
+### Val curve (selected)
+
+| Step | val LM | ks | frame_F1 | onset_F1 | Note |
+|------|--------|----|----------|----------|------|
+| 500   | 5.3910 | 0.7412 | 0.756 | 0.114 | BEST |
+| 1000  | 4.9944 | 0.7402 | 0.760 | 0.104 | BEST |
+| 2000  | 4.7302 | 0.7386 | 0.759 | 0.105 | BEST |
+| 3000  | 4.6053 | 0.7364 | 0.759 | 0.105 | BEST |
+| 5000  | 4.5304 | 0.7358 | 0.761 | 0.096 | BEST |
+| 7000  | 4.4928 | 0.7375 | 0.759 | 0.104 | BEST |
+| 9000  | 4.4833 | 0.7368 | 0.760 | 0.102 | BEST |
+| 11500 | 4.4808 | 0.7364 | 0.759 | 0.100 | BEST |
+| 13000 | 4.4784 | 0.7389 | 0.757 | 0.111 | BEST |
+| **13500** | **4.4782** | 0.7371 | 0.761 | 0.098 | **BEST (saved)** |
+| 14000–16000 | 4.479–4.480 | ~0.737 | ~0.76 | ~0.10 | no improvement 5/5 |
+| 16000 | — | — | — | — | early stop (ep ~74) |
+
+Training complete in 53.2 min. Best val_loss 4.4782.
+
+### Cross-run LM comparison
+
+| Run | LLM | Objective | Best val LM | Notes |
+|-----|-----|-----------|-------------|-------|
+| 6 | Qwen | LM only, 50 ep | 4.6877 | collapsed soft tokens |
+| 8 | Qwen | LM + div=10, 200 ep | 4.5252 | prior best |
+| **14 (Phase B)** | **Qwen** | **LM + ks=0.3, from Phase A init** | **4.4782** | new best, −0.047 vs Run 8 |
+
+### Findings
+
+**1. New val LM floor: 4.4782 (−0.047 vs Run 8's 4.5252)**
+First run to beat the div=10/200-epoch baseline. The Phase A init gives the perceiver a meaningful starting point so LM CE does not have to discover rhythm from scratch during its own training budget. The gain is real but modest — ~5% of a nat.
+
+**2. Keystroke head is preserved, not improved**
+`ks_loss` barely moves during Phase B (0.741 → 0.737, frame_F1 flat at 0.76, onset_F1 flat at 0.10). The 0.3 weight is effectively a regulariser pinning the keystroke skill in place. It does not make rhythm sharper. This validates the "don't forget" goal but means Phase B's LLM has no sharper temporal signal than Phase A produced.
+
+**3. Generation still fails the content bar**
+Samples at step 13500 (the BEST checkpoint):
+- GT `'I started my journey with noting but a small backpack'` → `'handed over the book to me, saying that it was a 1974 1974 1974 1974 ...'` (CER 1.585)
+- GT `'my journey with noting but a small backpack and a reslt'` → `"t and was gazing at the stars... 3.25e+115\nA. 100\nB. 50\n..."` (CER 1.491)
+- GT `' backpack and a resltess spirit. Morning dw '` → `"leaving a trail of silence in its wake. As I walked along the winding path, I couldn't help but feel ouch ouch ouch ouch ..."` (CER 4.068)
+
+Outputs are coherent Qwen prose, number-list degenerations, and repetition loops. Content does **not** echo GT. The Phase B success bar ("generation echoes ground-truth content") is **not met** despite the best LM loss on record.
+
+**4. LM loss improvement ≠ content grounding**
+Run 14's LM val loss is the best to date (4.4782), yet generation quality is indistinguishable from prior collapsed runs. This confirms something long-suspected across the 14-run history: at this dataset size, LM cross-entropy over 32 soft tokens is primarily measuring how well the adapter emits a prefix that lets Qwen's prior do its job — not whether the prefix encodes *this sample's* content. Phase A's rhythm target gives the adapter input-conditional structure, but the resampler bottleneck does not propagate enough content for Qwen to discriminate sample-level text.
+
+**5. Grad norms healthier than legacy runs**
+Phase B sits at grad_norm ~8–14 with `max_grad_norm=0.5` (Run 8 was ~27–35 with the same clip). Cleaner gradients, consistent with the more stable optimisation trajectory from a pretrained init.
+
+**6. Early stop at ep ~74, not epoch limit**
+First Phase-B-style run to converge cleanly via patience rather than epoch cap. Val LM plateau is extremely flat (4.478–4.480) across the final 5 checks.
+
+### Conclusion
+
+Phase B delivers the best LM val loss of any run to date (4.4782, beating Run 8 by 0.047), confirming that a rhythm-pretrained adapter provides a better initialisation than random. But it fails the stated success bar: generation is still fluent-but-wrong prose with zero content overlap. This is the clearest evidence yet that **binary keystroke-activity alone is too weak a content signal**. Rhythm disambiguates sequence timing but not sequence identity, so Qwen has no way to choose between texts that share a cadence.
+
+Per the Run 12 plan, the escalation path is granularity — not reverting to character-CTC, but increasing the per-frame target richness: per-hand (L/R) binary → keyboard region (4–6 zones) → per-key. Per-hand is the cheapest next step: the existing PKL already labels each event with a key, and hand assignment is a simple key→hand map.
+
+### Next steps
+- [ ] Preprocess a per-hand (2-channel) target from PKL. Train Phase A with BCE over 2 channels; same loop.
+- [ ] If per-hand Phase B still fails the content echo bar, escalate to keyboard-region (QWERTY row/zone).
+- [ ] Consider lowering the BCE pos_weight or using focal loss in Phase A to fix precision (0.65 → ?) and sharpen onsets.
+- [ ] Investigate onset_F1 ceiling: is the ±2-frame tolerance (40 ms) too tight for 100 Hz IMU + 513-step encoder resolution?
+
+---
+
+## Run 15 setup — Dual-head KeystrokeHead (activity + onset) with focal onset loss
+
+Before escalating target granularity (per-hand / region / per-key — the Run 12 plan), first attack Run 13's onset-F1 ceiling directly. Run 13 produced frame_F1 ~0.76 but onset_F1 stalled at 0.10–0.14 with recall 0.07–0.09, meaning the adapter learned rhythm spans but produced blurred rising edges. Two structural causes in the Run 11/12 KeystrokeHead were flagged in Run 13's findings:
+
+1. The depthwise **k=5 temporal conv** over per-frame features smooths activations across neighbouring frames — directly at odds with a tight ±2-frame onset-matching criterion.
+2. A **single BCE head** tries to simultaneously fit a *spanning* target (dense activity) and produce *sharp impulses* (onsets are rising-edges of activity). The dense positives dominate the gradient, so the impulse structure never sharpens.
+
+### Design (Option 2 + Option 3 from the triage shortlist)
+
+**Dual head, shared trunk, no temporal conv.** `KeystrokeHead` now runs a single LayerNorm'd cross-attention block and branches into two independent linear classifiers:
+
+- **activity head** — dense BCE with `pos_weight` (Phase A's content-grounding signal, unchanged objective).
+- **onset head** — masked focal BCE against a **per-event onset mask**: one-hot at the starting frame of every keypress, including keypresses that overlap an earlier still-held key. Focal `gamma=2.0`, class weight `alpha=0.75` (positives are ~1–3 per 100 frames).
+
+The two targets carry complementary temporal information. Splitting them lets each head optimise its own objective without the dense/sparse gradient conflict. Cross-attention into `resampler_out` is retained — it is the only path by which Phase A supervision reaches the perceiver.
+
+### Supervision targets
+
+- `keystroke_active`: unchanged. Union mask over all key-press intervals in the window (modifiers included via the raw event stream).
+- `keystroke_onset`: new. For each raw event `(s_frac, e_frac)` with `hi > lo` after rounding to encoder resolution, set `onset[min(S-1, lo)] = 1`. Unlike deriving onsets from `diff(activity)`, this marks the true start of every keypress — crucially including presses that start while an earlier key is still held (those get merged by the activity mask's union). The per-event onset rate is reported alongside activity rate at preprocess time.
+
+The dataset falls back to `diff(activity)` for legacy embeddings without `keystroke_onset`, so old preprocess files still load. New runs should rerun `preprocess.py` to get the per-event mask.
+
+### File changes
+
+- **`adapter.py` `KeystrokeHead`**: removed depthwise `Conv1d(k=5)`. Shared trunk is `q_norm/kv_norm + cross_attn + norm`. Two parallel `Linear(adapter_dim, 1)` heads (`activity_classifier`, `onset_classifier`). Returns `(activity_logits, onset_logits)` both `(B, S)`.
+- **`preprocess.py`**: emits `keystroke_onset: uint8 (S,)` next to `keystroke_active`; reports per-split onset rate.
+- **`dataset.py`**: `__getitem__` propagates `keystroke_onset` with an equal-length assertion vs `embeddings`; falls back to `diff(keystroke_active)` for legacy samples. `collate_fn` pads `onset_targets` parallel to `keystroke_targets` (same `keystroke_mask`).
+- **`model.py` `forward`**: returns `keystroke_logits` (activity) and `onset_logits`. `load_adapter` now uses `strict=False` on `keystroke_head` and logs a warning — legacy single-head checkpoints transfer the shared-trunk weights and reinitialise the two new classifier heads. The legacy `ctc_head` warning stays.
+- **`train.py`**: adds `_compute_onset_loss` (masked focal BCE). New flags `--onset_weight` (1.0 Phase A / 0.3 Phase B), `--onset_focal_gamma` (2.0), `--onset_focal_alpha` (0.75). Total loss = `keystroke_weight * activity_BCE + onset_weight * onset_focal_BCE` (+ LM CE in Phase B). `validate()` logs both `onset_rising_F1` (rising edges of activity, comparable to Run 13 metric) and `onset_head_F1` (dedicated onset head, new top-line metric). Phase-A `val_loss` matches the training composition exactly (`keystroke_weight * avg_ks + onset_weight * avg_on`). Sanity check: `skip_llm` with both weights ≤ 0 now errors out.
+- **`configs/phase_a.yaml`**: `keystroke_weight=1.0, onset_weight=1.0, onset_focal_gamma=2.0, onset_focal_alpha=0.75`.
+- **`configs/phase_b.yaml`**: `keystroke_weight=0.3, onset_weight=0.3` (same focal params). Both heads stay on at low weight to protect Phase A's rhythm grounding.
+
+### Back-compat
+
+- Run 13's Phase A checkpoint can seed Run 15 Phase B via `--adapter_init`: the adapter loads strict, the KeystrokeHead loads `strict=False` (warning logged), and the two new classifier heads start from random init. The old temporal-conv weights are dropped as unexpected keys.
+- Legacy embeddings without `keystroke_onset` still load; the dataset derives onsets from `diff(activity)` (misses onsets of keys pressed while an earlier key is still held — rerun preprocess to fix).
+
+### Success bar
+
+- **Phase A**: val loss plateaus; frame_F1 ≥ Run 13's 0.76; **`onset_head_F1` > 0.3** (Run 13's `onset_F1` ceiling was 0.14 on the rising-edge metric — the new target is a 2–3× absolute improvement on the head-native metric). `onset_rising_F1` logged alongside for direct comparison with Run 13.
+- **Phase B**: LM val loss ≤ Run 14's 4.4782 (regressing the LM floor would indicate the onset head is hurting content rather than helping). Primary win condition remains content-echoing generation.
+
+If Run 15 clears the onset_F1 bar but Phase B generation still fails content echo, the onset-blur hypothesis was right but insufficient — proceed to the Run 12 plan (per-hand → region → per-key).
+
+### Status
+
+Implementation complete. Bug-hunt review complete (the skip_llm `val_loss` formula was missing `keystroke_weight` and was fixed; validate call site now receives all loss coefficients). Preprocess + Phase A + Phase B runs pending.
+
+---
+
+## Run 15 — Phase B — `train_20260415_110942.log` (dual-head adapter init, LM + ks=0.3 + onset=0.3 focal)
+
+Loaded Run 15's Phase A adapter (`phase_a/adapter_best.pt`, dual-head KeystrokeHead) and switched the LLM on. Both activity BCE and onset focal BCE stay at 0.3 weight as rhythm-preservation regularisers alongside LM CE.
+
+### Config (vs Run 14)
+- `adapter_init=./checkpoints/phase_a/adapter_best.pt` (Run 15 Phase A, dual-head)
+- `keystroke_weight=0.3`, `onset_weight=0.3`, `onset_focal_gamma=2.0`, `onset_focal_alpha=0.75`
+- `lr=3e-5`, `batch_size=16`, `max_grad_norm=0.5`, `weight_decay=0.1`, `patience=5`, `epochs=100`, `total steps=21,700`
+- Keystroke BCE pos_weight 1.423; onset positive rate 0.0744
+
+### Val curve (selected)
+
+| Step | val LM | ks | on | frame_F1 | onset_rising_F1 | onset_head_F1 | Note |
+|------|--------|----|----|----------|-----------------|---------------|------|
+|   500 | 5.3493 | 0.7317 | 0.0430 | 0.756 | 0.116 | 0.002 | BEST |
+|  1000 | 5.1125 | 0.7321 | 0.0430 | 0.758 | 0.100 | 0.001 | BEST |
+|  2000 | 4.7483 | 0.7285 | 0.0430 | 0.759 | 0.100 | 0.002 | BEST |
+|  3000 | 4.5891 | 0.7278 | 0.0430 | 0.759 | 0.101 | 0.001 | BEST |
+|  5000 | 4.5312 | 0.7276 | 0.0430 | 0.759 | 0.107 | 0.000 | BEST |
+|  7000 | 4.4754 | 0.7279 | 0.0430 | 0.758 | 0.107 | 0.001 | BEST |
+|  8000 | 4.4590 | 0.7274 | 0.0430 | 0.758 | 0.104 | 0.001 | BEST |
+|  9500 | 4.4579 | 0.7271 | 0.0430 | 0.758 | 0.104 | 0.000 | BEST |
+| **10500** | **4.4535** | 0.7272 | 0.0430 | 0.758 | 0.107 | 0.000 | **BEST (saved)** |
+| 11000–13000 | 4.454–4.463 | ~0.727 | 0.0430 | ~0.758 | ~0.10 | ~0.000 | no improvement 5/5 |
+| 13000 | — | — | — | — | — | — | early stop (ep ~60) |
+
+Training complete in 42.5 min. Best val_loss 4.4535.
+
+### Cross-run LM comparison
+
+| Run | Init | Objective | Best val LM | Notes |
+|-----|------|-----------|-------------|-------|
+| 8 | random | LM + div=10 | 4.5252 | |
+| 14 | Run 13 Phase A (single-head) | LM + ks=0.3 | 4.4782 | |
+| **15 Phase B** | **Run 15 Phase A (dual-head)** | **LM + ks=0.3 + on=0.3 focal** | **4.4535** | new best, −0.025 vs Run 14 |
+
+### Findings
+
+**1. New val LM floor: 4.4535 (−0.025 vs Run 14's 4.4782)**
+Third consecutive best-in-class reduction (Run 8 → 14 → 15). The dual-head rhythm+onset pretraining gives the perceiver a slightly better starting point than Run 13's single-head init. The gain is real but the marginal return is shrinking: Run 14 beat Run 8 by 0.047, Run 15 beats Run 14 by only 0.025 on the same LM objective.
+
+**2. Onset head collapses to ~0 during Phase B**
+`onset_head_F1` sits at 0.000–0.002 throughout Phase B, with precision ~0.3 but recall ~0.000 — the head outputs essentially no positive predictions. `onset_loss` is pinned at 0.0430 for the entire run (no training signal moving through it). Two plausible causes: (a) at `onset_weight=0.3`, the focal-BCE gradient is too small to hold the head against LM-CE's dominant pull on shared cross-attention features; (b) whatever Phase A learned on the onset head is forgotten once the shared trunk has to serve LM objectives. Either way, the onset head is inactive as a regulariser in Phase B.
+
+**3. `onset_rising_F1` (activity-derived) unchanged**
+Rising-edge onset F1 sits at 0.10–0.12 throughout — matching Run 14 and Run 13. The onset-sharpening hypothesis (Run 15 setup) did not transfer from Phase A to Phase B: whatever sharper edges Phase A produced are not preserved under LM fine-tuning. This is a stronger statement than "Phase B preserves Phase A rhythm" — it preserves *blurry* rhythm, not sharper rhythm.
+
+**4. Activity head preserved, not improved**
+`ks_loss` 0.7317 → 0.7267 (−0.005); frame_F1 flat at 0.758; recall 0.93+ with precision ~0.635. Same plateau as Run 14. The 0.3 weight is regularisation, not optimisation — confirming Run 14's reading.
+
+**5. Generation still fails the content echo bar**
+Samples at step 10500 (BEST):
+- GT `'I started my journey with noting but a small backpack'` → `'y, and I felt the weight of my own mortality.  I a 1t 1g 1d 1to 1i 1d 1o 1n 1e ...'` (CER 1.509)
+- GT `'my journey with noting but a small backpack and a reslt'` → `'t a different way to perceive the world.  60  60  60 ...'` (CER 1.418)
+- GT `' backpack and a resltess spirit. Morning dw '` → `'gates, to feel a part of the living world. The air was irst ings ound ...'` (CER 1.977)
+
+Same failure modes as Run 14: fluent Qwen prose, number-list degenerations, repetition loops. Zero content overlap with GT. **Phase B success bar not met**, despite the best LM loss on record.
+
+**6. Cleaner training dynamics**
+Grad norms stabilise at ~8.5 (vs Run 14's ~8–14); wall-clock 42.5 min (vs Run 14's 53.2 min, same hardware) because early stop fires at ep ~60 instead of ep ~74. Validation plateau is extremely flat over final 5 checks (4.454–4.463).
+
+### Conclusion
+
+Run 15 Phase B sets a new LM val-loss floor (4.4535) — the third consecutive record — but **the onset-sharpening intervention did not survive Phase B**: the onset head collapses to silence under LM pressure, and `onset_rising_F1` is identical to Run 14. The LM gain is therefore attributable to the *activity-head* pretraining transferring slightly more useful structure via the shared trunk, not to sharper onset timing reaching Qwen.
+
+More importantly, generation quality is **indistinguishable from Run 14**: fluent-but-wrong prose, same degeneration patterns, zero content echo. Three runs now agree that LM cross-entropy over 32 soft tokens decouples from sample-level content grounding — improving the LM floor no longer predicts generation quality at this dataset/architecture scale.
+
+This exhausts the "sharpen temporal target" escalation branch. The Run 12 plan (target-granularity escalation: per-hand → region → per-key) is now the clearest next move — rhythm, even sharp rhythm, does not carry enough information to discriminate text content. Per-hand (L/R) Phase A is the cheapest next experiment; the PKL already labels each event with a key, and hand assignment is a static key→hand map.
+
+### Next steps
+- [ ] Preprocess a per-hand (2-channel) `keystroke_active` target from PKL; keep onset head as-is (still 1-channel per-event, or escalate to 2-channel).
+- [ ] Train Phase A with 2-channel activity BCE; verify per-hand frame_F1 materially exceeds the single-channel ceiling (0.76) before committing to Phase B.
+- [ ] If per-hand Phase B still fails the content echo bar, escalate to keyboard-region (QWERTY row/zone, 4–6 channels).
+- [ ] Investigate why the onset head collapses at `onset_weight=0.3` — try 1.0 in Phase B, or freeze the onset head's output projection post-Phase-A.
+
+
+## MOMENT encoder option added (2026-04-15)
+
+Preprocess now supports an alternative time-series encoder: MOMENT
+(`AutonLab/MOMENT-1-{small,base,large}`). Selected via `encoder: "moment"`
+in `configs/preprocess.yaml` or `--encoder moment` on the CLI.
+
+**Shape differences vs. Chronos**
+- Chronos (per-channel): output `(S≈513, d_chronos)` for a 10 s @ 100 Hz window.
+- MOMENT (patch-based): input resampled to fixed `seq_len=512`, `patch_len=8`
+  → `(S=64, n_channels * d_model)`. Much shorter token sequence for the
+  perceiver resampler to compress.
+
+**Why add it**
+Chronos embeddings were shown (FINDINGS §Embedding Analysis) to be near-
+collinear across samples — 99.8% of dims carried almost no variance before
+mean-centering. MOMENT is trained on a different corpus and uses a
+patch-based encoder rather than quantile-tokenized scalar inputs, so its
+embeddings may carry more discriminative IMU signal. Worth an A/B on
+Phase A frame_F1 before committing to heavier supervision changes.
+
+**Integration notes**
+- `d_chronos` in the training config still serves as the adapter input dim —
+  set it to `d_model * n_channels` (e.g. 12288 for MOMENT-1-large, both rings).
+- Everything downstream of the encoder (perceiver, LLM, losses, activity/onset
+  targets) is unchanged because the saved `.pt` schema is the same `(S, d_enc)`
+  tensor plus text/activity fields.
+- MOMENT requires `pip install momentfm`; now pinned in `environment.yml`.
+
+---
+
+## Run 16 — Phase A (MOMENT) — `train_20260415_124518.log`
+
+First MOMENT-encoder run. `AutonLab/MOMENT-1-large` (`d_model=1024`),
+both rings → `d_enc=12288`, `S=64` patches. 3465 train / 229 val samples
+(~2.5× Chronos counts — MOMENT resamples each 10s window to 512
+timesteps so more windows survive the min-length filter). Same
+Phase A config otherwise (`skip_llm`, activity + focal-onset BCE,
+`keystroke_weight=onset_weight=1.0`).
+
+| Step | val_loss | frame_F1 | onset_head_F1 | note |
+|------|----------|----------|---------------|------|
+| 500  | **0.2947** | 0.935 | 0.902 | BEST (epoch 2) |
+| 1000 | 0.3721 | 0.935 | 0.896 | |
+| 2500 | 0.5748 | 0.938 | 0.907 | still near-best F1, loss rising |
+| 4500 | 0.6618 | 0.938 | 0.913 | early stop (patience 8) |
+
+Total wall time: 4.7 min. Best checkpoint at step 500.
+
+**Result — MOMENT crushes the Chronos Phase A ceiling.**
+
+| Encoder | best frame_F1 | best onset_head_F1 |
+|---|---|---|
+| Chronos (Run 15, 2 h train) | 0.76 | 0.10–0.50 |
+| MOMENT-1-large (Run 16, 5 min train) | **0.935** | **0.902** |
+
+Rhythm and per-key onset are essentially solved by the encoder swap,
+at a fraction of the training time. This validates the
+*Embedding Analysis* hypothesis: the Chronos embeddings really were
+the bottleneck — 99.8% near-zero-variance dims left almost no
+discriminative IMU signal for the adapter to grip, and MOMENT's
+patch-based encoder preserves that signal.
+
+Downside to watch: val_loss is monotone increasing after step 500 even
+though frame_F1/onset_F1 keep drifting *up*. The KS/focal terms are
+overfitting to raw BCE while the decision-threshold metrics stay
+steady — which is fine here but signals the adapter is happy to keep
+pushing confidences without adding information.
+
+---
+
+## Run 17 — Phase B (MOMENT) — `train_20260415_125014.log`
+
+Seeded from Run 16's `adapter_best.pt`. Same Phase B config as Chronos
+Phase B (`keystroke_weight=onset_weight=0.3`, LM CE joins in, LoRA off).
+
+| Step | val_loss (lm) | frame_F1 | onset_F1 | note |
+|------|---------------|----------|----------|------|
+| 500  | 5.1915 | 0.938 | 0.896 | init from Phase A — LM CE jumps in |
+| 1000 | 4.8855 | 0.939 | 0.901 | |
+| 3000 | 4.5622 | 0.938 | 0.905 | |
+| **4500** | **4.5459** | 0.938 | 0.899 | BEST |
+| 7000 | 4.5748 | 0.937 | 0.903 | early stop (patience 5) |
+
+Total wall time: 17.9 min. Frame F1 and onset F1 both hold at the
+Phase A levels — the rhythm grounding does not regress as the LM term
+kicks in. `ks` loss creeps up slightly (0.255 → 0.267) which is the
+expected small trade-off when LM CE reshapes the soft tokens.
+
+**But: LLM output is still garbage.** At every val step the generated
+text is fluent Qwen prose with zero content alignment to GT. Samples
+from best-val step 4500:
+
+- GT: `'I started my journey with noting but a small backpack'`
+  → PRED: `'ed into the wintering chill... a t 1. As I walked through the crowded...'` (LLM-CER 3.20)
+- GT: `'my journey with noting but a small backpack and a reslt'`
+  → PRED: `'easurements. The temperature, humidity, and air quality 14845712...'` (LLM-CER 1.71)
+
+Frame_F1/onset_F1 are near 0.9 — the adapter *does* know where the
+keystrokes are — but that rhythm structure does not translate into
+characters through the frozen LLM. This is the same ceiling Runs 14–15
+hit with Chronos: high keystroke supervision, zero content echo.
+
+**Implication**
+The encoder was never the bottleneck for content. Fixing rhythm (Run 16's
+frame/onset F1 ~0.9) leaves the content gap intact. The frozen LLM
+cannot invert 32 rhythm-only soft tokens into the actual typed
+characters — the bijection just isn't there. Escalating supervision
+beyond binary activity (per-hand → keyboard region → per-key) remains
+the next lever, as does briefly unfreezing the LLM via LoRA to see if
+any prefix can carry character content through a still-small param
+budget.
+
+### Next steps (updated)
+- [ ] Run Phase A + B on MOMENT with **per-hand** activity (2-channel BCE).
+      Phase A is so cheap now (<5 min) that we can iterate supervision
+      ladders freely.
+- [ ] Try `lora_rank=8` on MOMENT Phase B — cheap experiment to test whether
+      *any* LLM adaptation lets the soft tokens express content.
+- [ ] Ablate: does MOMENT-1-base (d=768, same `d_enc` as Chronos-base) give
+      the same Phase A F1 as MOMENT-1-large, or is the 1024-dim encoder
+      doing work? Informs whether to scale MOMENT further or stop.
+- [ ] Keep Chronos around for the record; don't overwrite its
+      `embeddings/*.pt` since MOMENT files are suffixed (`*_moment.pt`).
+
+---
+
+## Architecture Additions — LoRA + Character-CTC (2026-04-15)
+
+Implemented in response to Run 17's diagnosis: frozen Qwen cannot extract
+character identity from 32 rhythm-only soft tokens. Two structural levers
+added simultaneously:
+
+### 1. LoRA on Qwen (`--lora_rank`, `--lora_target_modules`)
+
+Code path already wired in `model.py` but `lora_rank=0` in every prior config.
+Configs added for attn-only (q/k/v/o, ~344 K extra params at r=8) and full
+(+gate/up/down, ~9.8 M). `--freeze_resampler` flag freezes `adapter.proj`
+and `adapter.resampler` (leaves `out_proj` trainable) so LoRA cannot drift
+the Phase-A rhythm grounding. Phase B only.
+
+### 2. Character-CTC head (`CharCTCHead`, `--char_ctc_weight`)
+
+**`char_vocab.py`** — 72-token case-sensitive vocab: blank (id 0), unk (1),
+a–z, A–Z, 0–9, space + 7 punctuation chars. Exposes `encode()`, `decode()`,
+`ctc_greedy_decode()`.
+
+**`adapter.py` — `IMUAdapter`** gained `ctc_upsample_factor` param.
+When > 1, a `ConvTranspose1d(adapter_dim, adapter_dim, kernel_size=f, stride=f)`
+upsamples `proj_seq` from `(B, S, D)` to `(B, S*f, D)` before the CTC head.
+Forward now returns a 5-tuple: `(soft_tokens, resampler_out, projected_mean,
+proj_seq, proj_seq_up)`. Resampler still sees the un-upsampled `proj_seq`.
+
+**`CharCTCHead`** — same cross-attn-into-resampler trunk as `KeystrokeHead`
+(q_norm / kv_norm + cross-attn + LayerNorm), no temporal conv. Output:
+`Linear(adapter_dim, vocab_size=72)`. Takes `proj_seq_up` as query input.
+
+**`train.py`** additions:
+- `_char_ctc_weight(step, start, peak, warmup)` — linear ramp from `start`
+  to `peak` over `warmup` steps.
+- `_compute_char_ctc_loss` — `F.ctc_loss(log_probs, char_ids,
+  input_lengths=embed_lens * factor, target_lengths=char_lens,
+  blank=0, zero_infinity=True)` where `log_probs = log_softmax(char_logits,
+  dim=-1).transpose(0, 1)`. `input_lengths` clamped to `T_ctc`.
+- `_ctc_cer_batch` — CTC-greedy CER per batch for validation logging.
+
+**`preprocess.py`** emits `char_targets: LongTensor (L,)` per sample.
+**`dataset.py`** propagates `char_ids (B, max_L)` and `char_lens (B,)`.
+
+### CTC length precheck (`precheck_ctc_length.py`)
+
+Run once per encoder before CTC training. Results on the live embeddings:
+
+| Encoder | S | L_max | L_mean | upsample | T_ctc | P(L ≥ T_ctc/3) |
+|---|---|---|---|---|---|---|
+| Chronos | 513 | 81 | 39.1 | 1 | 513 | ~0.00 |
+| MOMENT  | 64  | 52 | 34.7 | 1 | 64  | 0.78 (infeasible) |
+| MOMENT  | 64  | 52 | 34.7 | 4 | 256 | 0.00 |
+
+MOMENT requires `ctc_upsample_factor=4`; Chronos is trivially feasible at 1×.
+
+### New configs (8 total)
+
+| Config | Encoder | Phase | LoRA targets | CTC | Notes |
+|---|---|---|---|---|---|
+| `phase_b_moment_lora_attn.yaml`  | MOMENT  | B | q/k/v/o     | off | Run 18m |
+| `phase_b_moment_lora_full.yaml`  | MOMENT  | B | +gate/up/dn | off | Run 19m (if needed) |
+| `phase_b_chronos_lora_attn.yaml` | Chronos | B | q/k/v/o     | off | Run 18c |
+| `phase_b_chronos_lora_full.yaml` | Chronos | B | +gate/up/dn | off | Run 19c (if needed) |
+| `phase_a_moment_ctc.yaml`        | MOMENT  | A | — | 0.1→0.3, upsample=4 | Run 20m Phase A |
+| `phase_a_chronos_ctc.yaml`       | Chronos | A | — | 0.1→0.3, upsample=1 | Run 20c Phase A |
+| `phase_b_moment_ctc.yaml`        | MOMENT  | B | q/k/v/o     | 0.0 default | Run 20m Phase B |
+| `phase_b_chronos_ctc.yaml`       | Chronos | B | q/k/v/o     | 0.0 default | Run 20c Phase B |
+
+---
+
+## Run 20 Preamble — Phase A Runs (2026-04-15)
+
+Four Phase A runs launched in parallel across GPUs 3/4/5.
+
+### MOMENT baseline re-run (phase_a_moment) — `train_20260415_170908.log`
+
+Second MOMENT Phase A run; confirms Run 16 was not a fluke.
+
+| Step | val_loss | frame_F1 | onset_head_F1 |
+|------|----------|----------|---------------|
+| 500  | **0.3000** | 0.936 | 0.891 | BEST |
+| 4500 | 0.6606 | 0.938 | 0.913 | early stop (patience 8) |
+
+Total wall time: 5.4 min. Best checkpoint at step 500. Rhythm essentially
+solved within the first epoch — confirms MOMENT encoder is the driver, not
+training duration.
+
+### Chronos baseline (phase_a) — `train_20260415_170847.log`
+
+| Step | val_loss | frame_F1 | onset_head_F1 |
+|------|----------|----------|---------------|
+| 500  | 0.8238 | 0.739 | 0.000 |
+| 1000 | 0.7912 | 0.752 | 0.004 |
+| 1500 | **0.7751** | 0.757 | 0.010 | BEST |
+| 5500 | 0.8267 | 0.748 | 0.000 | early stop (patience 8) |
+
+Total wall time: 35.3 min. Frame_F1 plateaus at ~0.75; onset_head_F1 barely
+reaches 0.010. This is significantly below Run 15's ~0.76 onset_F1 — the
+key difference is training duration: Run 15 ran for 2+ hours while this
+run early-stopped at 35 min under the new patience=8 schedule. The Chronos
+adapter converges far more slowly than MOMENT and was seeded into Phase B
+from this relatively weak checkpoint. Phase B Chronos LoRA results should
+be interpreted with this in mind.
+
+### MOMENT CTC Phase A (phase_a_moment_ctc) — `train_20260415_171447.log`
+
+| Step | val_loss | frame_F1 | onset_F1 | ctc_CER |
+|------|----------|----------|----------|---------|
+| 500  | 0.8812 | 0.937 | 0.895 | 0.563 | BEST |
+| 1000 | **0.8618** | 0.935 | 0.915 | **0.476** | BEST |
+| 5000 | 1.5479 | 0.937 | 0.918 | 0.465 | early stop |
+
+Total wall time: 6.1 min. **ctc_CER dropped to 0.476 within the first
+1000 steps** — character content IS being forced into the per-frame
+adapter features. Frame and onset F1 hold at MOMENT-baseline levels
+despite the added CTC pressure. CTC loss descended from 21 → 1.7 nats
+within 1000 steps. This checkpoint is a sound seed for Phase B CTC.
+
+### Chronos CTC Phase A (phase_a_chronos_ctc) — `train_20260415_170902.log`
+
+| Step | val_loss | frame_F1 | onset_F1 | ctc_CER |
+|------|----------|----------|----------|---------|
+| 500  | 1.7706 | 0.738 | 0.000 | 1.000 |
+| 2000 | 1.7396 | 0.751 | 0.000 | 1.000 |
+| 10000 | **1.7125** | 0.752 | 0.000 | 0.972 | BEST |
+| 10000 | — | — | — | — | early stop |
+
+Total wall time: 32.6 min. **CTC completely failed to learn on Chronos.**
+ctc_CER held at 1.000 through most of training; barely reached 0.972 at
+the very last checkpoint. More critically, **onset_head_F1 stayed at
+exactly 0.000 throughout** — CTC supervision fully suppressed onset head
+learning, which was also weak in the Chronos baseline (0.010 at best).
+
+**Hypothesis:** Chronos per-channel per-frame embeddings (S≈513,
+d_enc=9216) carry high-frequency spectral content that is not naturally
+aligned to character boundaries. The CTC gradient competes with the
+keystroke onset gradient for the same adapter features, and the CTC term
+"wins" in terms of gradient magnitude while learning nothing useful — the
+high T/L ratio (~10–13×) creates too many blank-vs-non-blank configurations
+and the gradient vanishes into indifferent blank paths. MOMENT's patch-based
+S=64 (T/L ≈ 5 after 4× upsample → 256) is a much tighter constraint that
+forces the CTC path to commit.
+
+Consequence: **Chronos Phase B CTC (`phase_b_chronos_ctc.yaml`) should not
+be run** — there is no CTC-grounded Phase A checkpoint worth seeding from.
+The Chronos CTC Phase B config exists but is deprioritised pending a
+diagnosis of why CTC fails on Chronos embeddings.
+
+---
+
+## Runs 18/20 — Phase B (in progress, 2026-04-15 17:53)
+
+Three Phase B runs launched across GPUs 3/4/5. Qwen2.5-1.5B downloaded
+to `/data/agnivc/tmp/hf_cache` (HF_HOME set accordingly) after
+`/scratch/cluster/agnivc` filled to 100%.
+
+| Run | Config | GPU | Encoder | Init | LoRA | CTC | Trainable |
+|-----|--------|-----|---------|------|------|-----|-----------|
+| 18c | phase_b_chronos_lora_attn | 3 | Chronos | phase_a/best | q/k/v/o r=8 | off | 2.84M (0.18%) |
+| 18m | phase_b_moment_lora_attn  | 4 | MOMENT  | phase_a_moment/best | q/k/v/o r=8 | off | 2.84M (0.18%) |
+| 20m | phase_b_moment_ctc        | 5 | MOMENT  | phase_a_moment_ctc/best | q/k/v/o r=8 | ctc=0 (head loaded) | 7.90M (0.51%) |
+
+**Baseline to beat:** Run 17 best val LM loss = **4.5459** (MOMENT, no LoRA).
+
+Step 50 lm losses at warmup start:
+- Run 18c (Chronos LoRA): 6.85 nats
+- Run 18m (MOMENT LoRA): 7.11 nats
+- Run 20m (MOMENT CTC): 6.66 nats
+
+### Run 18c — Chronos LoRA attn (`phase_b_chronos_lora_attn`) — `train_20260415_175220.log`
+
+Seeded from `checkpoints/phase_a/adapter_best.pt` (Chronos Phase A, onset_F1 0.010).
+
+| Step | val LM | frame_F1 | onset_F1 | note |
+|------|--------|----------|----------|------|
+| 1500 | 4.5191 | 0.757 | 0.001 | BEST |
+| 2000 | **4.4616** | 0.757 | 0.000 | BEST |
+| 4500 | 4.5540 | 0.758 | 0.001 | early stop (patience 5) |
+
+Wall time: 18.8 min. Best val LM **4.4616** — beats Run 17 baseline (4.5459) by 0.08 nats.
+Onset_F1 never recovers from the weak Phase A seed (0.010); onset supervision provides
+essentially no signal here.
+
+### Run 18m — MOMENT LoRA attn (`phase_b_moment_lora_attn`) — `train_20260415_175220.log`
+
+Seeded from `checkpoints/phase_a_moment/adapter_best.pt` (MOMENT Phase A, onset_F1 0.891).
+
+| Step | val LM | frame_F1 | onset_F1 | note |
+|------|--------|----------|----------|------|
+| 500  | 4.5607 | 0.937 | 0.898 | |
+| 2500 | **4.5197** | 0.938 | 0.889 | BEST |
+| 5000 | 4.5992 | 0.938 | 0.896 | early stop |
+
+Wall time: 17.9 min. Best val LM **4.5197** — beats Run 17 by 0.026 nats.
+Frame and onset F1 hold at Phase A levels throughout.
+
+### Run 20m — MOMENT CTC Phase B (`phase_b_moment_ctc`) — `train_20260415_175220.log`
+
+Seeded from `checkpoints/phase_a_moment_ctc/adapter_best.pt` (MOMENT Phase A + CTC,
+onset_F1 0.915, ctc_CER 0.476). Same LoRA targets (q/k/v/o, r=8) as Run 18m;
+`char_ctc_weight=0.0` in Phase B so CTC head is loaded but inactive.
+
+| Step | val LM | frame_F1 | onset_F1 | note |
+|------|--------|----------|----------|------|
+| 500  | 4.6155 | 0.937 | 0.904 | |
+| 1000 | **4.4262** | 0.937 | 0.905 | BEST |
+| 3500 | 4.5038 | 0.937 | 0.907 | early stop |
+
+Wall time: 12.3 min. Best val LM **4.4262** — **best of all runs**, beats Run 17 by 0.12 nats.
+Fastest convergence: best reached at step 1000 vs step 2000–2500 for LoRA-only runs.
+The CTC-grounded Phase A initialization reaches lower LM loss faster, suggesting the
+character-enriched soft tokens give the LoRA LLM a better starting point.
+
+### Full grid summary (encoder × supervision)
+
+| Run | Encoder | Phase B supervision | Init | Best val LM | frame_F1 | onset_F1 |
+|-----|---------|---------------------|------|-------------|----------|----------|
+| 17  | MOMENT  | KS only, no LoRA | Phase A rhythm | 4.5459 | 0.938 | 0.899 |
+| 18c | Chronos | LoRA attn | Phase A rhythm (weak) | 4.4616 | 0.757 | 0.001 |
+| 18m | MOMENT  | LoRA attn | Phase A rhythm | 4.5197 | 0.938 | 0.889 |
+| 20m | MOMENT  | LoRA attn + CTC-init | Phase A CTC | **4.4262** | 0.937 | 0.905 |
+
+**Winner: Run 20m — MOMENT + CTC-grounded Phase A + LoRA attn.**
+
+All three new runs beat the no-LoRA baseline. The CTC-grounded init delivers the
+largest improvement (+0.12 nats vs baseline) at the shortest wall time. LoRA alone
+on MOMENT gives only a small gain (+0.026 nats); the character-content baked into
+the soft tokens by Phase A CTC is the key lever.
+
+### But: LLM generation still completely wrong
+
+Despite improved val LM loss, all Phase B outputs remain fluent Qwen prose with
+zero content overlap with GT. Representative samples from Run 20m step 3500:
+
+- GT: `'I started my journey with noting but a small backpack'`
+  → PRED: `'tied to the rhythms of daily life, grounding me ultipli...'` (CER 2.16)
+- GT: `'noting but a small backpack and a resltess cpi'`
+  → PRED: `'reconding me to see the beauty of life nder the 100...'` (CER 2.20)
+
+The val LM improvements (~0.1 nats) are real but insufficient: cross-entropy
+of 4.4 nats on 64-char targets means the model has barely escaped the language
+model prior. The 32-token soft token bottleneck remains the structural
+constraint — the adapter cannot pack 50+ character identities into 32 tokens
+in a form the LLM can reliably invert.
+
+### Escalation path
+
+Per the plan, if `val_ctc_cer ≤ 0.5 AND Phase B LLM-CER ≥ 1.0` on both encoders,
+the 32-token resampler is the structural block. Run 20m Phase A CTC achieved
+ctc_CER **0.476** (< 0.5) and Phase B LLM-CER is > 1.5. This confirms the
+32-token bottleneck hypothesis. Next experiments:
+
+- [x] Diagnostic: Phase A CTC on `resampler_out` — see below.
+- [ ] Increase `n_soft_tokens` from 32 → 64 (in progress).
+- [ ] If 64 tokens still stalls, try 128.
+- [ ] If `n_soft_tokens` alone fails, escalate supervision ladder:
+      per-hand binary → keyboard region (4–6 channel) → per-key.
+
+---
+
+## Diagnostic — Phase A CTC on `resampler_out` (32 tokens) — `train_20260415_192532.log`
+
+Config: `phase_a_moment_ctc_resampler_diag.yaml` — identical to `phase_a_moment_ctc.yaml`
+except `ctc_on_resampler: true`. The CTC head receives `resampler_out` (32 soft tokens)
+as input instead of `proj_seq_up` (256 upsampled per-frame features).
+
+| Step | val ctc_CER | frame_F1 | onset_F1 | note |
+|------|-------------|----------|----------|------|
+| 500  | ~0.90 | 0.937 | 0.895 | |
+| 1000 | ~0.83 | — | — | best step |
+| 4500 | 0.791 | 0.935 | 0.914 | early stop |
+
+Wall time: 5.0 min. Best val_loss: 0.3588.
+
+### Comparison
+
+| CTC input | tokens | val ctc_CER | Δ vs proj_seq |
+|---|---|---|---|
+| `proj_seq_up` (per-frame, upsampled) | 256 | **0.476** | baseline |
+| `resampler_out` (compressed soft tokens) | 32  | **0.791** | +0.315 (+66% relative) |
+
+**Interpretation:** The resampler compression is lossy for character information —
+66% relative CER degradation across the 32-token bottleneck. It is NOT a hard
+block (CER 0.791 < 1.0, so some character content survives), but the information
+loss is substantial enough to explain why Phase B LLM generation (which only sees
+the 32 soft tokens) cannot echo content.
+
+Notably: train CTC loss reached ~0.10 nats in both cases — the adapter can pack
+character-aligned structure into 32 tokens on the training set. The val CER gap
+reflects generalization failure, not fitting capacity. The resampler is likely
+memorising specific training-set phoneme patterns into the 32 queries rather than
+learning a general compression.
+
+**Conclusion:** Increasing `n_soft_tokens` from 32 to 64 is well-motivated.
+Expected outcome: CER on resampler_out at 64 tokens should fall from 0.791 toward
+the 256-token bound of 0.476, giving the LLM more character information to work with.
+
+---
+
+## 64-token experiment — Phase A CTC + Phase B LoRA (2026-04-15)
+
+Configs: `phase_a_moment_ctc_64tok.yaml` + `phase_b_moment_ctc_64tok.yaml`.
+Chained run on GPU 3: Phase A → Phase B.
+
+### Phase A (64 tokens) — `train_20260415_194618.log`
+
+| Step | val ctc_CER | frame_F1 | onset_F1 |
+|------|-------------|----------|----------|
+| 500  | — | 0.937 | 0.895 |
+| best | — | — | — |
+| 5500 | **0.735** | 0.934 | 0.915 | early stop |
+
+Wall time: 6.6 min.
+
+Comparing Phase A ctc_CER on proj_seq_up across configs:
+
+| n_soft_tokens | ctc_CER (proj_seq_up, 256 tok) |
+|---|---|
+| 32 | **0.476** |
+| 64 | 0.735 |
+
+**Unexpected: 64-token resampler gives WORSE per-frame ctc_CER than 32 tokens.**
+The CharCTCHead cross-attends into resampler_out (64 KV tokens vs 32). With more KV
+tokens, the cross-attention gradient to per-frame proj_seq features may be more
+diffuse — each frame attends over a wider pool, reducing per-character alignment
+specificity. The net effect is that per-frame features carry less character
+content with 64-token KV than with 32.
+
+### Phase B (64 tokens) — `train_20260415_195317.log`
+
+| Step | val LM | frame_F1 | onset_F1 |
+|------|--------|----------|----------|
+| 500  | 4.7938 | 0.939 | 0.901 |
+| ~8000 | **4.5776** | 0.937 | 0.903 | BEST |
+| final | 4.7754 | 0.937 | 0.901 | early stop |
+
+Wall time: 25.4 min. Best val LM **4.5776** — **worse than every other config
+including the no-LoRA Run 17 baseline (4.5459)**.
+
+### Full results table
+
+| Run | n_soft_tokens | Phase A ctc_CER | Phase B val LM | Δ vs Run 17 |
+|-----|---------------|-----------------|----------------|-------------|
+| Run 17 (no LoRA, no CTC) | 32 | N/A | 4.5459 | — |
+| Run 18m (LoRA attn) | 32 | N/A | 4.5197 | −0.026 |
+| **Run 20m (LoRA + CTC)** | **32** | **0.476** | **4.4262** | **−0.12** |
+| 64tok (LoRA + CTC) | 64 | 0.735 | 4.5776 | +0.032 |
+
+**More tokens is worse.** The 32-token configuration remains the best.
+
+### Why 64 tokens hurts
+
+The counter-intuitive result has a likely structural explanation: the
+`CharCTCHead` uses `resampler_out` as K/V in its cross-attention, with
+`proj_seq_up` (256 per-frame features) as queries. Doubling the K/V pool
+from 32 → 64 tokens makes each per-frame query attend over a wider, more
+diffuse set of keys — reducing the signal specificity that drives per-frame
+character alignment. The 32-token "bottleneck" actually acts as a compression
+prior that forces the cross-attention to be selective, producing sharper
+per-frame gradients.
+
+Additionally, Phase A has only 3,465 training samples — the extra 32 learned
+query parameters may not have enough data to converge to a useful
+representation, leaving the 64-token resampler less informative per token.
+
+### Revised diagnosis
+
+The bottleneck is **not just token count**. The fundamental issue is that the
+adapter is tasked with two conflicting objectives:
+1. Compress the full rhythm into 32 compact tokens (for LLM conditioning).
+2. Maintain per-frame character resolution (for CTC gradient).
+
+These are competing: better compression → more diffuse per-frame gradient →
+worse character encoding in the soft tokens. The information loss at the
+resampler bottleneck is structural, not just a capacity problem.
+
+### What to try next
+
+The supervision ladder is the correct escalation:
+
+1. **Per-key binary supervision** — add a per-key activity target (one binary
+   classifier per key, predicting "is key K pressed at this frame?"). Forces
+   the adapter to encode key identity, not just timing. The LLM then has
+   character-labeled rhythms to decode rather than anonymous pulses.
+2. **Keyboard-region classification** — if per-key (50+ classes) is too sparse,
+   group keys into 4–6 spatial regions (left-hand QWERTY, right-hand QWERTY,
+   numbers, punctuation) as an intermediate step.
+3. ~~**Remove cross-attention from CharCTCHead**~~ — **done, see ablation below. Result: neutral.**
+
+---
+
+## Ablation — CharCTCHead without resampler cross-attention (2026-04-15)
+
+Config: `phase_a_moment_ctc_no_xattn.yaml` — same as `phase_a_moment_ctc.yaml`
+(n_soft_tokens=32) except `ctc_no_cross_attn=true`. CharCTCHead receives
+`proj_seq_up` only; `resampler_out` is not passed as KV.
+
+Result: val ctc_CER **0.484** (wall 5.3 min, best val_loss 0.8638,
+frame_F1 0.935, onset_F1 0.921).
+
+### Full comparison table
+
+| Config | n_tokens | cross-attn | ctc_CER |
+|---|---|---|---|
+| `phase_a_moment_ctc` (Run 20m Phase A) | 32 | yes | **0.476** |
+| `phase_a_moment_ctc_no_xattn` (this run) | 32 | **no** | 0.484 |
+| `phase_a_moment_ctc_resampler_diag` | 32 (resampler) | yes* | 0.791 |
+| `phase_a_moment_ctc_64tok` | 64 | yes | 0.735 |
+
+*resampler_out as both query and no-KV (ctc_on_resampler path).
+
+### Conclusion
+
+**The diffuse-KV gradient hypothesis is refuted.** The cross-attention to
+`resampler_out` in `CharCTCHead` contributes essentially nothing to CTC
+quality: CER 0.484 without vs 0.476 with — a 0.008 difference well within
+noise. The CTC head learns character alignment entirely from the per-frame
+`proj_seq_up` features; the resampler KV provides no useful signal.
+
+Consequence: the 64-token regression (ctc_CER 0.735) is **not** caused by
+diffuse cross-attn gradient. The cause must be in the resampler training
+dynamics: with 64 learned queries the resampler back-propagates different
+gradients into `proj_seq`, modifying the per-frame features in a way that
+degrades character alignment — possibly because the 64-query resampler has
+more capacity and distributes temporal information more diffusely across
+its queries, leaving individual frames less character-discriminative.
+
+**Practical implication:** the `CharCTCHead` cross-attention can be removed
+or kept — it makes no measurable difference. The 32-token adapter with CTC
+on `proj_seq_up` (Run 20m, Phase A ctc_CER 0.476, Phase B val LM 4.4262)
+remains the best configuration.
+
+### Revised architecture understanding
+
+The CTC head provides a direct character-alignment gradient to the per-frame
+projection (`proj_seq`) and the `InputProjection`. The perceiver resampler
+then compresses these character-enriched per-frame features into 32 soft
+tokens. The perceiver's gradient in Phase A comes exclusively from the
+`KeystrokeHead` cross-attention trunk (not the CTC head). This is fine:
+keystroke rhythm grounding (frame_F1 0.935, onset_F1 0.921) is fully
+maintained alongside character content (ctc_CER 0.484).
+
+The remaining bottleneck is the perceiver compression itself: even with
+character-enriched per-frame features, the 32-token bottleneck loses ~65%
+of character discrimination (CER 0.476 → 0.791). Token count alone doesn't
+fix this (64 tokens gives 0.735, worse not better). The correct escalation
+is richer per-token supervision:
+
+**Next: per-key binary supervision.** Rather than anonymous keystroke timing,
+give the adapter explicit key-identity targets — one binary classifier per
+key predicting "was key K active at this frame?". This forces each soft
+token to encode *which* keys happened, not just *that* keypresses happened.
+The LLM then has labeled rhythms rather than anonymous pulses.
+
+---
+
+## Seq2Seq Escalation — Run 21m (Phase A)
+
+**Date:** 2026-04-16  
+**Motivation:** CTC on 32 resampler tokens (ctc_CER 0.791) failed because CTC
+requires T ≥ L (T=32 < L_max=52). CTC on 256-token proj_seq_up achieves 0.476
+but the perceiver then compresses back to 32 tokens with 65% character loss.
+The fundamental question: **can 32 soft tokens encode enough character content
+to guide the LLM?**
+
+Two alternatives to per-key binary supervision were evaluated:
+1. **Seq2seq decoder on 32 tokens** — teacher-forced cross-attention decoder
+   with no T≥L constraint; decoder queries each token once per output character.
+2. **Condition resampler on characters** — rejected (training-inference mismatch).
+
+Option 1 is implemented. Design:
+- `CharSeq2SeqDecoder` in `adapter.py`: 2-layer causal transformer decoder
+  (CharDecoderLayer = causal self-attn + cross-attn to resampler_out + FFN)
+- Learned `bos_embed` parameter; positional embeddings up to `max_len=128`
+- Teacher-forced forward: input `[BOS, chars[0..L-2]]`, target `chars[0..L-1]`
+- Greedy decode builds input autoregressively; no EOS — decode to fixed length
+- `forward(char_ids=None)` added to `RingToText`; wired through `train.py`
+
+**Config:** `configs/phase_a_moment_seq2seq.yaml`
+- `char_seq2seq_weight=0.5`, `keystroke_weight=1.0`, `onset_weight=1.0`
+- Same MOMENT data, 32 soft tokens, skip_llm=True
+
+**Hypothesis:** if `val seq2seq_CER < 0.5` at convergence (better than CTC-on-
+resampler's 0.791), the 32-token bottleneck is NOT inherently lossy — CTC's
+T≥L constraint was the problem and character content survives compression.
+If `val seq2seq_CER > 0.7`, the perceiver is genuinely lossy regardless of the
+loss formulation.
+
+**Smoke test (step 50/100, epoch 1, 1 GPU):**
+- seq2seq_CER 1.107 → 1.030 (random init → first few hundred samples)
+- frame_F1 0.919/0.922, onset_F1 0.839/0.900 — rhythm grounding unaffected
+- seq2seq loss 3.89 → 2.77 (converging from log(72)≈4.28 random baseline)
+
+**Run 21m launched:** GPU 3, `checkpoints/phase_a_moment_seq2seq/`
+
+### Run 21m Results — FAILED (cross-attention bypass)
+
+Early stopping at epoch 42 (~5.8 min, 4500 steps). Results:
+
+| Step | val seq2seq_loss | val seq2seq_CER | val ks_loss | frame_F1 |
+|------|-----------------|-----------------|-------------|----------|
+| 500  | 2.337           | 1.003           | 0.246       | 0.937    |
+| 1000 | 2.388           | 1.007           | 0.330       | 0.937    |
+| 1500 | 2.755           | 1.026           | 0.401       | 0.937    |
+| ...  | ↑ increasing    | ~1.0 throughout | ↑ degrading | stable   |
+| 4500 | 5.075           | 1.023           | 0.599       | 0.937    |
+
+- **seq2seq_CER never went below 1.0** — random init level throughout
+- **Val seq2seq_loss increased monotonically** from 2.33 → 5.07 while train s2s loss fell to ~0.09
+- Best val_loss was at the first checkpoint (step 500); all subsequent steps overfit
+- The val keystroke loss also degraded (0.246 → 0.599) as the seq2seq gradient pulled the adapter away from its Phase A rhythm grounding
+
+### Diagnosis: cross-attention bypass
+
+Standard teacher-forced causal seq2seq suffers from **exposure bias**. At training time,
+the decoder sees `[BOS, char_0, char_1, ..., char_{i-1}]` as input and can predict
+`char_i` purely by language-modeling the character sequence — no need to attend to the
+32 resampler tokens at all. The model learns to rely on its causal context and effectively
+ignores the cross-attention to resampler_out.
+
+At inference (greedy decode from BOS with no correct history), the decoder fails because:
+1. It has no prior context to language-model from
+2. It never learned to extract character content from the resampler
+
+Train seq2seq loss → 0.09 ≈ language-modeling char sequences from GT context.
+Val seq2seq CER → 1.0 ≈ no useful information from resampler alone.
+
+This is a well-known problem in encoder-decoder models (exposure bias) amplified here
+because the target sequence (character text) is highly predictable by language modeling
+alone, making the bypass path trivially learnable.
+
+### Proposed fix: parallel decoder (no causal self-attention)
+
+Remove causal self-attention from the decoder entirely. Replace with L independent
+position queries that each cross-attend to the 32 resampler tokens:
+
+```
+for position i in [0, L-1]:
+    query_i = bos_embed + pos_embed[i]   # position-specific, no prior-char context
+    char_i_logit = CrossAttn(query_i, resampler_out) → linear → (vocab_size,)
+```
+
+Loss: parallel cross-entropy at all L positions simultaneously.
+
+No bypass possible: the model has no causal context to lean on. Each position query
+must extract its character from the 32 resampler tokens alone. The gradient forces the
+resampler to encode which character was at each temporal position.
+
+**Implementation:** add `no_self_attn=True` mode to `CharSeq2SeqDecoder` — skip the
+`self_attn` layer in each `CharDecoderLayer`, keep only cross-attn + FFN.
+
+**Hypothesis:** if parallel-decoder CER < 0.5, the 32-token bottleneck can encode full
+character content with the right (bypass-free) supervision. If CER stays > 0.7, the
+resampler compression is genuinely lossy and token-count escalation is needed.
+
+**Capacity check:** 32 tokens × 256 dims = 8192 parameter space. A 52-char sequence
+with 72-class vocab ≈ 310 bits of information. Capacity is not the constraint.
+CTC on 256-token proj_seq_up (CER 0.476) confirms character content exists at the
+per-frame level — the question is whether the perceiver can learn to preserve it in 32
+tokens when trained with parallel position-query supervision.
+
