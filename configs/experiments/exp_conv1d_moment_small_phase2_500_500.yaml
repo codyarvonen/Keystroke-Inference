@@ -1,0 +1,66 @@
+# MOMENT-1-small Stage-1 run aligned with exp_conv1d_phase2_500_500_best_so_far.yaml
+# (same export, window, head hparams, training recipe). Encoder + cache signature differ from Chronos.
+#
+# Train:
+#   nohup conda run -n keyng python train_stage1_chronos.py --config configs/experiments/exp_conv1d_moment_small_phase2_500_500.yaml > outputs/output_moment_phase2_500_500.log 2>&1 & disown
+#
+# Requires: conda env `keyng` with momentfm installed (e.g. pip install momentfm).
+
+paths:
+  export_dir: exports/stage1_export_holdout_randval_coarse_l500_r500
+  data_dir: data
+  out_dir: checkpoints/hpo_phase2/moment_l500_r500_best_so_far
+  log_file: null
+
+model:
+  stage1_encoder: moment
+  moment_model: AutonLab/MOMENT-1-small
+  chronos_model: autogluon/chronos-2-small
+  device: cuda:0
+  freeze_encoder: false
+  encoder_finetune_last_n: 2
+  use_embedding_cache: true
+  embedding_cache_storage: memmap
+  embedding_cache_dir: checkpoints/hpo_phase2/shared_cache_l500_r500_moment
+  recompute_embedding_cache: false
+  cache_test_embeddings: false
+  context_length: 256
+  head_type: conv1d
+  encoder_num_variates: 12
+  head_hidden_dim: 384
+  head_num_layers: 2
+  head_dropout: 0.11522355427036489
+  head_conv_channels: 384
+  head_conv_d_proj: 128
+  head_conv_kernel_size: 5
+  head_conv_num_layers: 2
+  head_lstm_hidden_dim: 256
+  head_lstm_num_layers: 1
+  encoder_output_trim: false
+  encoder_output_drop_last_specials: 0
+  lr_encoder: 1.0e-5
+
+window:
+  left_ms: 500
+  right_ms: 500
+  target_rate_hz: 100.0
+
+training:
+  epochs: 25
+  batch_size: 16
+  lr: 0.00013833898215127175
+  weight_decay: 0.010162673904953734
+  num_workers: 4
+  seed: 42
+  loss_type: weighted_ce
+  class_weight_mode: inverse_sqrt
+  focal_gamma: 2.0
+  class_balance_beta: 0.9999
+
+early_stopping:
+  patience: 3
+  min_delta: 0.0001
+  early_stopping_metric: val_loss
+
+norm:
+  recompute_norm: false

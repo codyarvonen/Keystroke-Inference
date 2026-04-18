@@ -7,7 +7,7 @@ from .stage1 import (
     build_stage1_vocab_from_train,
     export_stage1_to_dir,
     load_stage1_vocab,
-    exports/stage1_export_config_from_manifest,
+    stage1_export_config_from_manifest,
 )
 from .windows import WindowRecord
 

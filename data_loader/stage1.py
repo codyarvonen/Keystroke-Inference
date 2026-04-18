@@ -506,7 +506,7 @@ def row_to_export_record(
     return d
 
 
-def exports/stage1_export_config_from_manifest(
+def stage1_export_config_from_manifest(
     manifest: Mapping[str, Any],
     *,
     data_dir: Optional[str] = None,

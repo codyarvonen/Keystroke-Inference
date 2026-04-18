@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Stage-1 training: Chronos-2 encoder + configurable classification head (frozen encoder by default, or last-N-block fine-tuning).
+Stage-1 training: Chronos-2 or MOMENT-1 encoder + configurable classification head (frozen by default, or last-N-block fine-tuning).
 
-Requires: pip install "chronos-forecasting>=2.0" pyyaml
+Requires: pip install "chronos-forecasting>=2.0" pyyaml (Chronos) and/or ``momentfm`` (MOMENT).
 
-Uses Chronos2Pipeline.embed() when the encoder is frozen; with ``--encoder-finetune-last-n N`` uses ``model.encode`` for gradients on the last N encoder blocks.
+Uses Chronos2Pipeline.embed() or MOMENT ``embed(..., reduction='none')`` when the encoder is frozen; with ``--encoder-finetune-last-n N`` uses Chronos ``model.encode`` or MOMENT embed with gradients on the last N backbone blocks.
 With embedding cache, stores pre-pool tokens (B×V×L×D); default storage is on-disk memmap
 (low RAM). Heads consume full tokens (MLP, attention pool, Conv1d, BiLSTM, etc.) or legacy
 pooled (B×D) for linear heads.
@@ -59,6 +59,15 @@ from models.chronos_finetune import (
     configure_chronos_encoder_finetune,
     set_encoder_finetune_train_mode,
 )
+from models.moment_finetune import (
+    configure_moment_encoder_finetune,
+    set_moment_encoder_finetune_train_mode,
+)
+from models.moment_stage1 import (
+    load_moment_pipeline,
+    moment_embed_stacked,
+    read_moment_patch_info,
+)
 from models.stage1_losses import (
     bincount_labels,
     build_stage1_criterion,
@@ -78,11 +87,25 @@ def _require_chronos():
         raise e
 
 
+def _require_moment():
+    try:
+        from momentfm import MOMENTPipeline  # noqa: F401
+    except ImportError as e:
+        print(
+            "Missing momentfm. Install with:\n" "  pip install momentfm",
+            file=sys.stderr,
+        )
+        raise e
+
+
 # Single source of truth for argparse dest names / YAML keys (snake_case).
 TRAINING_DEFAULTS: Dict[str, Any] = {
     "export_dir": "exports/stage1_export",
     "data_dir": "data",
+    # foundation encoder: "chronos" (Chronos-2) or "moment" (MOMENT-1-*)
+    "stage1_encoder": "chronos",
     "chronos_model": "autogluon/chronos-2-small",
+    "moment_model": "AutonLab/MOMENT-1-small",
     "device": "cuda:1",
     "epochs": 5,
     "batch_size": 32,
@@ -239,7 +262,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         merged.update(loaded)
 
     m = merged
-    p = argparse.ArgumentParser(description="Train Stage-1 keystroke classifier (Chronos-2 + head).")
+    p = argparse.ArgumentParser(description="Train Stage-1 keystroke classifier (Chronos-2 or MOMENT + head).")
     p.add_argument(
         "--config",
         "-c",
@@ -251,10 +274,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--export-dir", type=str, default=m["export_dir"], help="Dir with vocab.json + *.jsonl")
     p.add_argument("--data-dir", type=str, default=m["data_dir"], help="Raw IMU/PKL (must match export)")
     p.add_argument(
+        "--stage1-encoder",
+        type=str,
+        default=m["stage1_encoder"],
+        choices=("chronos", "moment"),
+        help="Frozen / fine-tuned time-series backbone: Chronos-2 or MOMENT-1",
+    )
+    p.add_argument(
         "--chronos-model",
         type=str,
         default=m["chronos_model"],
-        help="HF model id (default: autogluon/chronos-2-small)",
+        help="HF model id when --stage1-encoder chronos (default: autogluon/chronos-2-small)",
+    )
+    p.add_argument(
+        "--moment-model",
+        type=str,
+        default=m["moment_model"],
+        help="HF model id when --stage1-encoder moment (default: AutonLab/MOMENT-1-small)",
     )
     p.add_argument("--device", type=str, default=m["device"], help="e.g. cuda:1 or cpu")
     p.add_argument("--epochs", type=int, default=m["epochs"])
@@ -402,7 +438,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=int,
         default=m["encoder_finetune_last_n"],
         metavar="N",
-        help="Fine-tune the last N Chronos2 encoder transformer blocks (+ final_layer_norm). 0 = frozen encoder.",
+        help="Fine-tune the last N transformer encoder blocks (+ final_layer_norm). "
+        "Chronos: Chronos2 encoder; MOMENT: T5 encoder. 0 = frozen backbone.",
     )
     p.add_argument(
         "--lr-encoder",
@@ -613,10 +650,15 @@ def evaluate(
     encoder_output_drop_last_specials: int = 2,
     chronos_input_patch_size: int = 16,
     encoder_finetune_last_n: int = 0,
+    stage1_encoder: str = "chronos",
+    moment_seq_len: int = 512,
 ) -> Dict[str, float]:
     head.eval()
     if encoder_finetune_last_n > 0:
-        set_encoder_finetune_train_mode(pipeline.model, encoder_finetune_last_n, training=False)
+        if stage1_encoder == "moment":
+            set_moment_encoder_finetune_train_mode(pipeline, encoder_finetune_last_n, training=False)
+        else:
+            set_encoder_finetune_train_mode(pipeline.model, encoder_finetune_last_n, training=False)
     totals = {"n": 0, "loss": 0.0}
     acc_sums = {"top1": 0.0, "top3": 0.0, "top5": 0.0}
     for batch in loader:
@@ -628,13 +670,30 @@ def evaluate(
             lengths = lengths.to(device=device, dtype=torch.long)
         if encoder_finetune_last_n > 0:
             imu = imu_cpu.to(device)
-            stacked = chronos_encode_multivariate_grad(
-                pipeline, imu, context_length=context_length
-            ).to(device, dtype=torch.float32)
+            if stage1_encoder == "moment":
+                stacked = moment_embed_stacked(
+                    pipeline,
+                    imu,
+                    moment_seq_len=moment_seq_len,
+                    device=device,
+                    grad=False,
+                )
+            else:
+                stacked = chronos_encode_multivariate_grad(
+                    pipeline, imu, context_length=context_length
+                ).to(device, dtype=torch.float32)
         else:
-            # Chronos embed() manages its own loader/pin-memory path; pass CPU tensors here.
-            emb_list, _ = pipeline.embed(imu_cpu, batch_size=b, context_length=context_length)
-            stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+            if stage1_encoder == "moment":
+                stacked = moment_embed_stacked(
+                    pipeline,
+                    imu_cpu,
+                    moment_seq_len=moment_seq_len,
+                    device=device,
+                    grad=False,
+                )
+            else:
+                emb_list, _ = pipeline.embed(imu_cpu, batch_size=b, context_length=context_length)
+                stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
         stacked = apply_stage1_encoder_trim(
             stacked,
             lengths,
@@ -720,13 +779,17 @@ def _cache_signature_payload(
     split_path: Path,
     stats_path: Path,
     patch_info: Mapping[str, Any],
+    *,
+    moment_seq_len: int = 0,
 ) -> Dict[str, Any]:
-    return {
+    out: Dict[str, Any] = {
         "split_path": str(split_path.resolve()),
         "split_mtime_ns": split_path.stat().st_mtime_ns,
         "norm_stats_path": str(stats_path.resolve()),
         "norm_stats_mtime_ns": stats_path.stat().st_mtime_ns,
+        "stage1_encoder": getattr(args, "stage1_encoder", "chronos"),
         "chronos_model": args.chronos_model,
+        "moment_model": getattr(args, "moment_model", None),
         "context_length": int(args.context_length),
         "left_ms": int(args.left_ms),
         "right_ms": int(args.right_ms),
@@ -736,6 +799,9 @@ def _cache_signature_payload(
         "cache_format": "encoder_tokens_pre_pool",
         "cache_storage_dtype": "float16",
     }
+    if int(moment_seq_len) > 0:
+        out["moment_seq_len"] = int(moment_seq_len)
+    return out
 
 
 @torch.no_grad()
@@ -797,6 +863,9 @@ def _build_or_load_cached_embeddings(
     args: argparse.Namespace,
     logger: logging.Logger,
     force_recompute: bool,
+    stage1_encoder: str,
+    moment_seq_len: int,
+    device: torch.device,
 ) -> Tuple[Any, Dict[str, Any]]:
     """
     Build or load cached encoder features. Returns (dataset, cache_meta) where dataset is
@@ -813,7 +882,13 @@ def _build_or_load_cached_embeddings(
     len_mm_path = cache_dir / f"{split_name}_embed_lengths.mmap"
     meta_path = cache_dir / f"{split_name}_cache_meta.json"
 
-    sig_payload = _cache_signature_payload(args=args, split_path=split_path, stats_path=stats_path, patch_info=patch_info)
+    sig_payload = _cache_signature_payload(
+        args=args,
+        split_path=split_path,
+        stats_path=stats_path,
+        patch_info=patch_info,
+        moment_seq_len=int(moment_seq_len) if stage1_encoder == "moment" else 0,
+    )
     sig_hash = _stable_json_hash(sig_payload)
 
     if (not force_recompute) and meta_path.is_file():
@@ -882,8 +957,17 @@ def _build_or_load_cached_embeddings(
             y = batch["label_id"].to(torch.long).cpu()
             lens = batch["lengths"].to(torch.long).cpu()
             b = int(imu.shape[0])
-            emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
-            stacked = stack_embeddings_from_embed_list(emb_list).to(dtype=torch.float32, device="cpu")
+            if stage1_encoder == "moment":
+                stacked = moment_embed_stacked(
+                    pipeline,
+                    imu,
+                    moment_seq_len=moment_seq_len,
+                    device=device,
+                    grad=False,
+                ).to(dtype=torch.float32, device="cpu")
+            else:
+                emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
+                stacked = stack_embeddings_from_embed_list(emb_list).to(dtype=torch.float32, device="cpu")
             if mm_f is None:
                 v1, l1, d1 = (int(stacked.shape[i]) for i in (1, 2, 3))
                 v_ld = (v1, l1, d1)
@@ -965,8 +1049,17 @@ def _build_or_load_cached_embeddings(
         y = batch["label_id"].to(torch.long).cpu()
         lens = batch["lengths"].to(torch.long).cpu()
         b = int(imu.shape[0])
-        emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
-        stacked = stack_embeddings_from_embed_list(emb_list).to(dtype=torch.float32, device="cpu")
+        if stage1_encoder == "moment":
+            stacked = moment_embed_stacked(
+                pipeline,
+                imu,
+                moment_seq_len=moment_seq_len,
+                device=device,
+                grad=False,
+            ).to(dtype=torch.float32, device="cpu")
+        else:
+            emb_list, _ = pipeline.embed(imu, batch_size=b, context_length=context_length)
+            stacked = stack_embeddings_from_embed_list(emb_list).to(dtype=torch.float32, device="cpu")
         h_chunks.append(stacked)
         y_chunks.append(y)
         len_chunks.append(lens)
@@ -1081,6 +1174,12 @@ def _clone_state_dict_cpu(module: nn.Module) -> Dict[str, torch.Tensor]:
     return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
 
 
+def _encoder_module_for_ckpt(pipeline: Any, stage1_encoder: str) -> nn.Module:
+    if stage1_encoder == "moment":
+        return pipeline
+    return pipeline.model
+
+
 def _build_head_ckpt(
     head: nn.Module,
     d_model: int,
@@ -1092,6 +1191,7 @@ def _build_head_ckpt(
     *,
     pipeline: Optional[Any] = None,
     encoder_finetune_last_n: int = 0,
+    stage1_encoder: str = "chronos",
 ) -> Dict[str, Any]:
     hc = head_config_from_args(args)
     hc["d_model"] = d_model
@@ -1103,11 +1203,13 @@ def _build_head_ckpt(
         "num_classes": num_classes,
         "context_length": context_length,
         "chronos_model": chronos_model,
+        "stage1_encoder": stage1_encoder,
+        "moment_model": getattr(args, "moment_model", None),
         "loss_config": loss_meta,
         "encoder_finetune_last_n": int(encoder_finetune_last_n),
     }
     if pipeline is not None and int(encoder_finetune_last_n) > 0:
-        out["model_state_dict"] = pipeline.model.state_dict()
+        out["model_state_dict"] = _encoder_module_for_ckpt(pipeline, stage1_encoder).state_dict()
     return out
 
 
@@ -1118,8 +1220,7 @@ def run_training(
     optuna_prune_min_epochs: int = 2,
 ) -> Dict[str, Any]:
     """Run one training job. If ``optuna_trial`` is set, reports val metrics and supports pruning."""
-    _require_chronos()
-    from chronos import Chronos2Pipeline
+    stage1_encoder = str(getattr(args, "stage1_encoder", "chronos"))
     finetune_n = int(getattr(args, "encoder_finetune_last_n", 0))
     if not args.freeze_encoder and finetune_n == 0:
         raise NotImplementedError(
@@ -1172,51 +1273,102 @@ def run_training(
             args.device,
         )
 
-    logger.info("Loading Chronos: %s", args.chronos_model)
-    t0 = time.perf_counter()
-    pipeline = Chronos2Pipeline.from_pretrained(args.chronos_model)
-    pipeline.model.to(device)
-    if finetune_n > 0:
-        n_enc_layers = configure_chronos_encoder_finetune(pipeline.model, finetune_n)
-        logger.info(
-            "Encoder fine-tune: last %d transformer block(s) + final_layer_norm trainable (encoder depth=%d).",
-            finetune_n,
-            n_enc_layers,
-        )
-        if args.freeze_encoder:
-            logger.warning(
-                "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
-                finetune_n,
-            )
-    else:
-        for p in pipeline.model.parameters():
-            p.requires_grad = False
-    pipeline.model.eval()
-    logger.info("Chronos loaded on %s in %.1fs", device, time.perf_counter() - t0)
+    moment_seq_len = 0
+    if stage1_encoder == "chronos":
+        _require_chronos()
+        from chronos import Chronos2Pipeline
 
-    patch_info = read_chronos_patch_info(pipeline)
-    if patch_info:
-        logger.info("Chronos patch config: %s", patch_info)
-        ips = patch_info.get("input_patch_size")
-        if ips and args.target_rate_hz > 0:
-            ms = 1000.0 * ips / args.target_rate_hz
-            est = math.ceil(args.context_length / ips) if args.context_length else None
+        logger.info("Loading Chronos: %s", args.chronos_model)
+        t0 = time.perf_counter()
+        pipeline = Chronos2Pipeline.from_pretrained(args.chronos_model)
+        pipeline.model.to(device)
+        if finetune_n > 0:
+            n_enc_layers = configure_chronos_encoder_finetune(pipeline.model, finetune_n)
             logger.info(
-                "At %.1f Hz, input_patch_size=%d steps ≈ %.1f ms per patch; "
-                "context_length=%d → ~%s input patches along time (per series before specials).",
-                args.target_rate_hz,
-                ips,
-                ms,
-                args.context_length,
-                est,
+                "Encoder fine-tune: last %d transformer block(s) + final_layer_norm trainable (encoder depth=%d).",
+                finetune_n,
+                n_enc_layers,
             )
-    else:
-        logger.info("Could not read chronos_config from model (patch info unavailable).")
+            if args.freeze_encoder:
+                logger.warning(
+                    "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
+                    finetune_n,
+                )
+        else:
+            for p in pipeline.model.parameters():
+                p.requires_grad = False
+        pipeline.model.eval()
+        logger.info("Chronos loaded on %s in %.1fs", device, time.perf_counter() - t0)
 
-    if getattr(args, "chronos_input_patch_size", None) is None:
-        args.chronos_input_patch_size = int((patch_info or {}).get("input_patch_size", 16) or 16)
+        patch_info = read_chronos_patch_info(pipeline)
+        if patch_info:
+            logger.info("Chronos patch config: %s", patch_info)
+            ips = patch_info.get("input_patch_size")
+            if ips and args.target_rate_hz > 0:
+                ms = 1000.0 * ips / args.target_rate_hz
+                est = math.ceil(args.context_length / ips) if args.context_length else None
+                logger.info(
+                    "At %.1f Hz, input_patch_size=%d steps ≈ %.1f ms per patch; "
+                    "context_length=%d → ~%s input patches along time (per series before specials).",
+                    args.target_rate_hz,
+                    ips,
+                    ms,
+                    args.context_length,
+                    est,
+                )
+        else:
+            logger.info("Could not read chronos_config from model (patch info unavailable).")
+
+        if getattr(args, "chronos_input_patch_size", None) is None:
+            args.chronos_input_patch_size = int((patch_info or {}).get("input_patch_size", 16) or 16)
+        else:
+            args.chronos_input_patch_size = int(args.chronos_input_patch_size)
+
+    elif stage1_encoder == "moment":
+        _require_moment()
+        logger.info("Loading MOMENT: %s", args.moment_model)
+        t0 = time.perf_counter()
+        pipeline = load_moment_pipeline(args.moment_model, device)
+        if finetune_n > 0:
+            n_enc_layers = configure_moment_encoder_finetune(pipeline, finetune_n)
+            logger.info(
+                "Encoder fine-tune: last %d T5 block(s) + final_layer_norm trainable (encoder depth=%d).",
+                finetune_n,
+                n_enc_layers,
+            )
+            if args.freeze_encoder:
+                logger.warning(
+                    "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
+                    finetune_n,
+                )
+        else:
+            for p in pipeline.parameters():
+                p.requires_grad = False
+        pipeline.eval()
+        logger.info("MOMENT loaded on %s in %.1fs", device, time.perf_counter() - t0)
+
+        patch_info = read_moment_patch_info(pipeline)
+        if patch_info:
+            logger.info("MOMENT patch config: %s", patch_info)
+        moment_seq_len = int(getattr(pipeline.config, "seq_len", 512) or 512)
+        if getattr(args, "chronos_input_patch_size", None) is None:
+            args.chronos_input_patch_size = int((patch_info or {}).get("patch_len", 8) or 8)
+        else:
+            args.chronos_input_patch_size = int(args.chronos_input_patch_size)
+        logger.info(
+            "MOMENT seq_len=%d: each window is linearly resampled to this many time steps before patching "
+            "(this is sequence length, not sample rate in Hz).",
+            moment_seq_len,
+        )
+        if int(getattr(args, "encoder_output_drop_last_specials", 0)) != 0:
+            logger.info(
+                "MOMENT has no Chronos trailing special tokens; setting encoder_output_drop_last_specials "
+                "from %d to 0.",
+                int(args.encoder_output_drop_last_specials),
+            )
+            args.encoder_output_drop_last_specials = 0
     else:
-        args.chronos_input_patch_size = int(args.chronos_input_patch_size)
+        raise ValueError(f"Unknown --stage1-encoder {stage1_encoder!r} (expected chronos or moment).")
 
     train_ds = Stage1IMUKeyDataset(export_dir / "train.jsonl", stage_cfg)
     val_ds = Stage1IMUKeyDataset(export_dir / "val.jsonl", stage_cfg)
@@ -1277,12 +1429,23 @@ def run_training(
         n_tot,
     )
     with torch.no_grad():
-        emb0, _ = pipeline.embed(imu0, batch_size=b0, context_length=args.context_length)
-    d_model = int(emb0[0].shape[-1])
-    args.encoder_num_variates = int(emb0[0].shape[0])
+        if stage1_encoder == "chronos":
+            emb_list, _ = pipeline.embed(imu0, batch_size=b0, context_length=args.context_length)
+            e0 = emb_list[0]
+        else:
+            stacked_probe = moment_embed_stacked(
+                pipeline,
+                imu0,
+                moment_seq_len=moment_seq_len,
+                device=device,
+                grad=False,
+            )
+            e0 = stacked_probe[0]
+    d_model = int(e0.shape[-1])
+    args.encoder_num_variates = int(e0.shape[0])
     logger.info(
         "Embed probe: first series emb shape=%s, d_model=%d, V=%d, num_classes=%d",
-        tuple(emb0[0].shape),
+        tuple(e0.shape),
         d_model,
         args.encoder_num_variates,
         num_classes,
@@ -1328,7 +1491,7 @@ def run_training(
         lstm_hidden_dim=args.head_lstm_hidden_dim,
         lstm_num_layers=args.head_lstm_num_layers,
     ).to(device)
-    enc_trainable = [p for p in pipeline.model.parameters() if p.requires_grad]
+    enc_trainable = [p for p in _encoder_module_for_ckpt(pipeline, stage1_encoder).parameters() if p.requires_grad]
     if finetune_n > 0:
         if not enc_trainable:
             raise RuntimeError(
@@ -1373,6 +1536,9 @@ def run_training(
             args=args,
             logger=logger,
             force_recompute=bool(args.recompute_embedding_cache),
+            stage1_encoder=stage1_encoder,
+            moment_seq_len=int(moment_seq_len),
+            device=device,
         )
         val_ds_cached, val_cache_meta = _build_or_load_cached_embeddings(
             split_name="val",
@@ -1386,6 +1552,9 @@ def run_training(
             args=args,
             logger=logger,
             force_recompute=bool(args.recompute_embedding_cache),
+            stage1_encoder=stage1_encoder,
+            moment_seq_len=int(moment_seq_len),
+            device=device,
         )
         cache_meta_by_split["train"] = train_cache_meta
         cache_meta_by_split["val"] = val_cache_meta
@@ -1403,6 +1572,9 @@ def run_training(
                 args=args,
                 logger=logger,
                 force_recompute=bool(args.recompute_embedding_cache),
+                stage1_encoder=stage1_encoder,
+                moment_seq_len=int(moment_seq_len),
+                device=device,
             )
             cache_meta_by_split["test"] = test_cache_meta
 
@@ -1446,7 +1618,10 @@ def run_training(
         test_loader = test_loader_raw
 
     meta = {
+        "stage1_encoder": stage1_encoder,
         "chronos_model": args.chronos_model,
+        "moment_model": getattr(args, "moment_model", None),
+        "moment_seq_len": int(moment_seq_len) if stage1_encoder == "moment" else None,
         "export_dir": str(export_dir),
         "context_length": args.context_length,
         "num_classes": num_classes,
@@ -1486,7 +1661,10 @@ def run_training(
     for epoch in range(1, args.epochs + 1):
         head.train()
         if finetune_n > 0:
-            set_encoder_finetune_train_mode(pipeline.model, finetune_n, training=True)
+            if stage1_encoder == "moment":
+                set_moment_encoder_finetune_train_mode(pipeline, finetune_n, training=True)
+            else:
+                set_encoder_finetune_train_mode(pipeline.model, finetune_n, training=True)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         t_ep = time.perf_counter()
@@ -1532,16 +1710,35 @@ def run_training(
                 opt.zero_grad(set_to_none=True)
                 if finetune_n > 0:
                     imu = imu_cpu.to(device)
-                    stacked = chronos_encode_multivariate_grad(
-                        pipeline, imu, context_length=int(args.context_length)
-                    )
+                    if stage1_encoder == "moment":
+                        stacked = moment_embed_stacked(
+                            pipeline,
+                            imu,
+                            moment_seq_len=int(moment_seq_len),
+                            device=device,
+                            grad=True,
+                        )
+                    else:
+                        stacked = chronos_encode_multivariate_grad(
+                            pipeline, imu, context_length=int(args.context_length)
+                        )
                 else:
                     with torch.no_grad():
-                        # Keep embed() input on CPU; move returned stacked embeddings to training device.
-                        emb_list, _ = pipeline.embed(
-                            imu_cpu, batch_size=b, context_length=args.context_length
-                        )
-                    stacked = stack_embeddings_from_embed_list(emb_list).to(device, dtype=torch.float32)
+                        if stage1_encoder == "moment":
+                            stacked = moment_embed_stacked(
+                                pipeline,
+                                imu_cpu,
+                                moment_seq_len=int(moment_seq_len),
+                                device=device,
+                                grad=False,
+                            )
+                        else:
+                            emb_list, _ = pipeline.embed(
+                                imu_cpu, batch_size=b, context_length=args.context_length
+                            )
+                            stacked = stack_embeddings_from_embed_list(emb_list).to(
+                                device, dtype=torch.float32
+                            )
                 stacked = apply_stage1_encoder_trim(
                     stacked,
                     lengths,
@@ -1580,6 +1777,8 @@ def run_training(
                 encoder_output_drop_last_specials=int(args.encoder_output_drop_last_specials),
                 chronos_input_patch_size=int(args.chronos_input_patch_size),
                 encoder_finetune_last_n=int(finetune_n),
+                stage1_encoder=stage1_encoder,
+                moment_seq_len=int(moment_seq_len),
             )
         if device.type == "cuda":
             mem_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
@@ -1628,7 +1827,7 @@ def run_training(
             }
             best_head_state_cpu = _clone_state_dict_cpu(head)
             if finetune_n > 0:
-                best_model_state_cpu = _clone_state_dict_cpu(pipeline.model)
+                best_model_state_cpu = _clone_state_dict_cpu(_encoder_module_for_ckpt(pipeline, stage1_encoder))
             ckpt_best = _build_head_ckpt(
                 head,
                 d_model,
@@ -1639,6 +1838,7 @@ def run_training(
                 loss_meta,
                 pipeline=pipeline,
                 encoder_finetune_last_n=finetune_n,
+                stage1_encoder=stage1_encoder,
             )
             torch.save(ckpt_best, head_best_path)
             logger.info(
@@ -1666,7 +1866,9 @@ def run_training(
 
     head.load_state_dict({k: v.to(device) for k, v in best_head_state_cpu.items()})
     if best_model_state_cpu is not None:
-        pipeline.model.load_state_dict({k: v.to(device) for k, v in best_model_state_cpu.items()})
+        _encoder_module_for_ckpt(pipeline, stage1_encoder).load_state_dict(
+            {k: v.to(device) for k, v in best_model_state_cpu.items()}
+        )
 
     test_m: Optional[Dict[str, float]] = None
     if bool(args.eval_test_split):
@@ -1693,6 +1895,8 @@ def run_training(
                 encoder_output_drop_last_specials=int(args.encoder_output_drop_last_specials),
                 chronos_input_patch_size=int(args.chronos_input_patch_size),
                 encoder_finetune_last_n=int(finetune_n),
+                stage1_encoder=stage1_encoder,
+                moment_seq_len=int(moment_seq_len),
             )
         logger.info(
             "test  loss=%.4f  top1/3/5=%.4f/%.4f/%.4f",
@@ -1714,6 +1918,7 @@ def run_training(
         loss_meta,
         pipeline=pipeline,
         encoder_finetune_last_n=finetune_n,
+        stage1_encoder=stage1_encoder,
     )
     head_path = out_dir / "head.pt"
     torch.save(ckpt, head_path)
