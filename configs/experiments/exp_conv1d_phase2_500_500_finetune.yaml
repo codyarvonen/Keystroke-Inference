@@ -1,0 +1,65 @@
+# Best-so-far config from Optuna study stage1_phase2a_frozen_head.
+# Source trial: checkpoints/hpo_phase2/trials_phase2a/trial_0002
+# best val_loss: 1.1130431921784252
+#
+# Train once:
+#   python train_stage1_chronos.py --config configs/experiments/exp_conv1d_phase2_500_500_best_so_far.yaml
+#
+# Evaluate test split:
+#   python evaluate_stage1_chronos.py --head-ckpt checkpoints/hpo_phase2/best_so_far_manual/head.pt --meta-path checkpoints/hpo_phase2/best_so_far_manual/train_meta.json --norm-stats checkpoints/hpo_phase2/trials_phase2a/shared_norm_stats.json --split test
+
+paths:
+  export_dir: exports/stage1_export_holdout_randval_coarse_l500_r500
+  data_dir: data
+  out_dir: checkpoints/hpo_phase2/best_so_far_manual
+  log_file: null
+
+model:
+  chronos_model: autogluon/chronos-2-small
+  device: cuda:0
+  freeze_encoder: false
+  encoder_finetune_last_n: 2
+  use_embedding_cache: true
+  embedding_cache_storage: memmap
+  embedding_cache_dir: checkpoints/hpo_phase2/shared_cache_l500_r500
+  recompute_embedding_cache: false
+  cache_test_embeddings: false
+  context_length: 256
+  head_type: conv1d
+  encoder_num_variates: 12
+  head_hidden_dim: 384
+  head_num_layers: 2
+  head_dropout: 0.11522355427036489
+  head_conv_channels: 384
+  head_conv_d_proj: 128
+  head_conv_kernel_size: 5
+  head_conv_num_layers: 2
+  head_lstm_hidden_dim: 256
+  head_lstm_num_layers: 1
+  encoder_output_trim: false
+
+window:
+  left_ms: 500
+  right_ms: 500
+  target_rate_hz: 100.0
+
+training:
+  epochs: 25
+  batch_size: 16
+  lr: 0.00013833898215127175
+  lr_encoder: 1.0e-5
+  weight_decay: 0.010162673904953734
+  num_workers: 4
+  seed: 42
+  loss_type: weighted_ce
+  class_weight_mode: inverse_sqrt
+  focal_gamma: 2.0
+  class_balance_beta: 0.9999
+
+early_stopping:
+  patience: 3
+  min_delta: 0.0001
+  early_stopping_metric: val_loss
+
+norm:
+  recompute_norm: false
