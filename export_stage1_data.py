@@ -25,8 +25,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target-rate-hz", type=float, default=100.0)
     p.add_argument(
         "--session-split-strategy",
-        choices=["session_random", "session_holdout", "session_holdout_random_train_val"],
+        choices=[
+            "session_random",
+            "session_holdout",
+            "session_holdout_random_train_val",
+            "session_pool",
+        ],
         default="session_random",
+        help="session_pool: single pool.jsonl + vocab for CV (use train_stage1_chronos --cv-mode).",
     )
     p.add_argument(
         "--holdout-test-random-train-val",

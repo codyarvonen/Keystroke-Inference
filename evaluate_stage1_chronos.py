@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from data_loader.config import Stage1ExportConfig
-from data_loader.stage1 import load_stage1_vocab, exports/stage1_export_config_from_manifest
+from data_loader.stage1 import load_stage1_vocab, stage1_export_config_from_manifest
 from data_loader.stage1_dataset import Stage1IMUKeyDataset
 from data_loader.stage1_norm import (
     collate_stack_lr_pad_batch,
@@ -97,7 +97,7 @@ def default_eval_out_dir(head_ckpt: Path, split: str) -> Path:
 
 
 def _build_stage1_cfg(manifest: Dict[str, Any], data_dir_override: str | None) -> Stage1ExportConfig:
-    return exports/stage1_export_config_from_manifest(manifest, data_dir=data_dir_override)
+    return stage1_export_config_from_manifest(manifest, data_dir=data_dir_override)
 
 
 def _collate_for_chronos(mean: np.ndarray, std: np.ndarray, context_length: int):
