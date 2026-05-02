@@ -179,6 +179,11 @@ def _assign_session_splits(
             stacklevel=2,
         )
 
+    if cfg.session_split_strategy == "session_pool":
+        for sess in session_keys:
+            split_map[sess] = "train"
+        return split_map
+
     if cfg.session_split_strategy == "session_holdout":
         test_sessions = set(cfg.test_sessions)
         val_sessions = set(cfg.val_sessions)
@@ -542,7 +547,10 @@ def export_stage1_to_dir(
     out_dir: str | Path,
 ) -> Dict[str, Any]:
     """
-    Build rows, train-only vocab, write vocab.json and train/val/test.jsonl.
+    Build rows, train-only vocab.
+
+    For ``session_pool``, writes ``pool.jsonl`` + ``vocab.json`` + ``manifest.json`` only.
+    Otherwise writes ``train.jsonl`` / ``val.jsonl`` / ``test.jsonl`` + ``vocab.json`` + ``manifest.json``.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -551,6 +559,50 @@ def export_stage1_to_dir(
     token_to_id, id_to_token = build_stage1_vocab(rows, cfg)
     label_scheme = "coarse_32" if cfg.coarse_labels else None
     save_stage1_vocab(out / "vocab.json", token_to_id, id_to_token, label_scheme=label_scheme)
+
+    subjects_sorted = sorted({r.subject for r in rows})
+    sessions_sorted = sorted({r.session_key for r in rows})
+
+    if cfg.session_split_strategy == "session_pool":
+        pool_path = out / "pool.jsonl"
+        unk_pool = 0
+        with pool_path.open("w", encoding="utf-8") as f:
+            for r in rows:
+                rec = row_to_export_record(r, token_to_id)
+                if rec["is_unk"]:
+                    unk_pool += 1
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        written_per_split = {"pool": len(rows), "train": 0, "val": 0, "test": 0}
+        unk_per_split = {"pool": unk_pool, "train": 0, "val": 0, "test": 0}
+        manifest: Dict[str, Any] = {
+            "exports/stage1_export_version": 1,
+            "config": {
+                "data_dir": cfg.data_dir,
+                "left_context_ms": cfg.left_context_ms,
+                "right_context_ms": cfg.right_context_ms,
+                "target_rate_hz": cfg.target_rate_hz,
+                "rings_used": cfg.rings_used,
+                "session_split_strategy": cfg.session_split_strategy,
+                "test_sessions": list(cfg.test_sessions),
+                "val_sessions": list(cfg.val_sessions),
+                "val_ratio": cfg.val_ratio,
+                "test_ratio": cfg.test_ratio,
+                "split_seed": cfg.split_seed,
+                "balance_val_test_by_session_rows": cfg.balance_val_test_by_session_rows,
+                "merge_letter_case": cfg.merge_letter_case,
+                "coarse_labels": cfg.coarse_labels,
+                "train_only_sessions": list(cfg.train_only_sessions),
+            },
+            "build_stats": stats,
+            "vocab_size": len(token_to_id),
+            "rows_written": written_per_split,
+            "unk_label_count_by_split": unk_per_split,
+            "pool_row_count": len(rows),
+            "unique_subjects": subjects_sorted,
+            "unique_session_keys": sessions_sorted,
+        }
+        (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+        return manifest
 
     by_split: Dict[str, List[Stage1KeyWindowRow]] = {"train": [], "val": [], "test": []}
     for r in rows:
@@ -571,7 +623,7 @@ def export_stage1_to_dir(
         unk_per_split[split_name] = unk_count
         written_per_split[split_name] = len(split_rows)
 
-    manifest: Dict[str, Any] = {
+    manifest = {
         "exports/stage1_export_version": 1,
         "config": {
             "data_dir": cfg.data_dir,

@@ -11,6 +11,10 @@ pooled (B×D) for linear heads.
 
 Defaults can be loaded from a YAML file: --config configs/stage1_chronos.defaults.yaml
 (CLI flags override). See TRAINING_DEFAULTS and configs/stage1_chronos.defaults.yaml.
+
+Cross-validation: export with ``export_stage1_data.py --session-split-strategy session_pool``
+(produces ``pool.jsonl``), then ``--cv-mode lopo|loso_all|loso_personalized``.
+Per-fold train normalization disables embedding cache for CV (see logs).
 """
 
 from __future__ import annotations
@@ -38,7 +42,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from data_loader.config import Stage1ExportConfig
-from data_loader.stage1 import load_stage1_vocab
+from data_loader.stage1 import load_stage1_jsonl_rows, load_stage1_vocab, stage1_export_config_from_manifest
+from data_loader.stage1_cv import build_stage1_cv_folds
 from data_loader.stage1_dataset import Stage1IMUKeyDataset
 from data_loader.stage1_norm import (
     collate_stack_lr_pad_batch,
@@ -158,6 +163,11 @@ TRAINING_DEFAULTS: Dict[str, Any] = {
     "class_weight_mode": "inverse_sqrt",
     "focal_gamma": 2.0,
     "class_balance_beta": 0.9999,
+    # Cross-validation (requires pool.jsonl from export --session-split-strategy session_pool)
+    "cv_mode": "none",
+    "cv_split_seed": 42,
+    "cv_fold_index": None,
+    "cv_val_ratio": 0.2,
 }
 
 
@@ -468,6 +478,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=m["class_balance_beta"],
         help="Beta for effective-number class weights (only if --class-weight-mode effective)",
     )
+    p.add_argument(
+        "--cv-mode",
+        type=str,
+        default=m["cv_mode"],
+        choices=("none", "lopo", "loso_all", "loso_personalized"),
+        help="Cross-validation on pool.jsonl (from session_pool export). none = train/val/test.jsonl.",
+    )
+    p.add_argument("--cv-split-seed", type=int, default=m["cv_split_seed"])
+    p.add_argument(
+        "--cv-fold-index",
+        type=int,
+        default=m["cv_fold_index"],
+        help="Run a single fold by index (0-based). Default: run all folds sequentially.",
+    )
+    p.add_argument(
+        "--cv-val-ratio",
+        type=float,
+        default=m["cv_val_ratio"],
+        help="Random fraction of non-test rows used for validation within each CV fold.",
+    )
     args = p.parse_args(rest)
     if args.early_stopping_metric not in ("val_loss", "val_top1"):
         raise ValueError(f"Invalid early_stopping_metric: {args.early_stopping_metric!r}")
@@ -551,6 +581,15 @@ def make_stage1_cfg(args: argparse.Namespace) -> Stage1ExportConfig:
         right_context_ms=args.right_ms,
         target_rate_hz=args.target_rate_hz,
     )
+
+
+def load_stage1_cfg_from_export(export_dir: Path, args: argparse.Namespace) -> Stage1ExportConfig:
+    """Prefer manifest.json (rings, coarse labels, …) when present."""
+    man_path = export_dir / "manifest.json"
+    if man_path.is_file():
+        manifest = json.loads(man_path.read_text(encoding="utf-8"))
+        return stage1_export_config_from_manifest(manifest, data_dir=args.data_dir)
+    return make_stage1_cfg(args)
 
 
 def compute_train_label_counts(train_ds: Stage1IMUKeyDataset, num_classes: int) -> torch.Tensor:
@@ -1213,166 +1252,31 @@ def _build_head_ckpt(
     return out
 
 
-def run_training(
+def _train_one_split(
     args: argparse.Namespace,
+    logger: logging.Logger,
+    log_path: Path,
     *,
+    device: torch.device,
+    pipeline: Any,
+    stage1_encoder: str,
+    finetune_n: int,
+    moment_seq_len: int,
+    patch_info: Dict[str, Any],
+    stage_cfg: Stage1ExportConfig,
+    export_dir: Path,
+    embedding_split_paths: Tuple[Path, Path, Path],
+    vocab_path: Path,
+    num_classes: int,
+    train_ds: Stage1IMUKeyDataset,
+    val_ds: Stage1IMUKeyDataset,
+    test_ds: Stage1IMUKeyDataset,
+    out_dir: Path,
+    fold_meta: Optional[Dict[str, Any]] = None,
     optuna_trial: Any = None,
     optuna_prune_min_epochs: int = 2,
 ) -> Dict[str, Any]:
-    """Run one training job. If ``optuna_trial`` is set, reports val metrics and supports pruning."""
-    stage1_encoder = str(getattr(args, "stage1_encoder", "chronos"))
-    finetune_n = int(getattr(args, "encoder_finetune_last_n", 0))
-    if not args.freeze_encoder and finetune_n == 0:
-        raise NotImplementedError(
-            "Encoder fine-tuning: set --encoder-finetune-last-n N (N > 0) for last-N-block fine-tuning, "
-            "or use --freeze-encoder (default) for head-only training."
-        )
-    set_seed(args.seed)
-    export_dir = Path(args.export_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if args.log_file:
-        log_path = Path(args.log_file)
-    else:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        log_path = out_dir / f"train_{stamp}.log"
-    logger = setup_logging(log_path)
-    logger.info("Logging to %s", log_path.resolve())
-    if args.config:
-        logger.info("Config file: %s", Path(args.config).resolve())
-    else:
-        logger.info("Config file: (none; using built-in TRAINING_DEFAULTS unless overridden on CLI)")
-    logger.info(
-        "Run settings: epochs=%d batch_size=%d lr=%s patience=%d early_stopping_metric=%s",
-        args.epochs,
-        args.batch_size,
-        args.lr,
-        args.patience,
-        args.early_stopping_metric,
-    )
-
-    vocab_path = export_dir / "vocab.json"
-    if not vocab_path.exists():
-        raise FileNotFoundError(f"Missing {vocab_path}. Run export_stage1_data.py first.")
-
-    num_classes = vocab_num_classes(vocab_path)
-    stage_cfg = make_stage1_cfg(args)
-
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("CUDA requested but not available; using cpu.")
-        device = torch.device("cpu")
-    else:
-        device = torch.device(args.device)
-
-    if device.type == "cuda":
-        cuda_idx = device.index if device.index is not None else torch.cuda.current_device()
-        logger.info(
-            "Training on CUDA device index %s (%s); resolved from args.device=%r",
-            cuda_idx,
-            torch.cuda.get_device_name(device),
-            args.device,
-        )
-
-    moment_seq_len = 0
-    if stage1_encoder == "chronos":
-        _require_chronos()
-        from chronos import Chronos2Pipeline
-
-        logger.info("Loading Chronos: %s", args.chronos_model)
-        t0 = time.perf_counter()
-        pipeline = Chronos2Pipeline.from_pretrained(args.chronos_model)
-        pipeline.model.to(device)
-        if finetune_n > 0:
-            n_enc_layers = configure_chronos_encoder_finetune(pipeline.model, finetune_n)
-            logger.info(
-                "Encoder fine-tune: last %d transformer block(s) + final_layer_norm trainable (encoder depth=%d).",
-                finetune_n,
-                n_enc_layers,
-            )
-            if args.freeze_encoder:
-                logger.warning(
-                    "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
-                    finetune_n,
-                )
-        else:
-            for p in pipeline.model.parameters():
-                p.requires_grad = False
-        pipeline.model.eval()
-        logger.info("Chronos loaded on %s in %.1fs", device, time.perf_counter() - t0)
-
-        patch_info = read_chronos_patch_info(pipeline)
-        if patch_info:
-            logger.info("Chronos patch config: %s", patch_info)
-            ips = patch_info.get("input_patch_size")
-            if ips and args.target_rate_hz > 0:
-                ms = 1000.0 * ips / args.target_rate_hz
-                est = math.ceil(args.context_length / ips) if args.context_length else None
-                logger.info(
-                    "At %.1f Hz, input_patch_size=%d steps ≈ %.1f ms per patch; "
-                    "context_length=%d → ~%s input patches along time (per series before specials).",
-                    args.target_rate_hz,
-                    ips,
-                    ms,
-                    args.context_length,
-                    est,
-                )
-        else:
-            logger.info("Could not read chronos_config from model (patch info unavailable).")
-
-        if getattr(args, "chronos_input_patch_size", None) is None:
-            args.chronos_input_patch_size = int((patch_info or {}).get("input_patch_size", 16) or 16)
-        else:
-            args.chronos_input_patch_size = int(args.chronos_input_patch_size)
-
-    elif stage1_encoder == "moment":
-        _require_moment()
-        logger.info("Loading MOMENT: %s", args.moment_model)
-        t0 = time.perf_counter()
-        pipeline = load_moment_pipeline(args.moment_model, device)
-        if finetune_n > 0:
-            n_enc_layers = configure_moment_encoder_finetune(pipeline, finetune_n)
-            logger.info(
-                "Encoder fine-tune: last %d T5 block(s) + final_layer_norm trainable (encoder depth=%d).",
-                finetune_n,
-                n_enc_layers,
-            )
-            if args.freeze_encoder:
-                logger.warning(
-                    "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
-                    finetune_n,
-                )
-        else:
-            for p in pipeline.parameters():
-                p.requires_grad = False
-        pipeline.eval()
-        logger.info("MOMENT loaded on %s in %.1fs", device, time.perf_counter() - t0)
-
-        patch_info = read_moment_patch_info(pipeline)
-        if patch_info:
-            logger.info("MOMENT patch config: %s", patch_info)
-        moment_seq_len = int(getattr(pipeline.config, "seq_len", 512) or 512)
-        if getattr(args, "chronos_input_patch_size", None) is None:
-            args.chronos_input_patch_size = int((patch_info or {}).get("patch_len", 8) or 8)
-        else:
-            args.chronos_input_patch_size = int(args.chronos_input_patch_size)
-        logger.info(
-            "MOMENT seq_len=%d: each window is linearly resampled to this many time steps before patching "
-            "(this is sequence length, not sample rate in Hz).",
-            moment_seq_len,
-        )
-        if int(getattr(args, "encoder_output_drop_last_specials", 0)) != 0:
-            logger.info(
-                "MOMENT has no Chronos trailing special tokens; setting encoder_output_drop_last_specials "
-                "from %d to 0.",
-                int(args.encoder_output_drop_last_specials),
-            )
-            args.encoder_output_drop_last_specials = 0
-    else:
-        raise ValueError(f"Unknown --stage1-encoder {stage1_encoder!r} (expected chronos or moment).")
-
-    train_ds = Stage1IMUKeyDataset(export_dir / "train.jsonl", stage_cfg)
-    val_ds = Stage1IMUKeyDataset(export_dir / "val.jsonl", stage_cfg)
-    test_ds = Stage1IMUKeyDataset(export_dir / "test.jsonl", stage_cfg)
+    """Train/val/(test) for one data split (standard export or one CV fold)."""
 
     if args.norm_stats_path:
         stats_path = Path(args.norm_stats_path)
@@ -1516,6 +1420,10 @@ def run_training(
     if finetune_n > 0 and args.use_embedding_cache:
         logger.warning("encoder_finetune_last_n=%d: embedding cache disabled (encoder gradients required).", finetune_n)
     cache_enabled = bool(args.freeze_encoder and args.use_embedding_cache) and finetune_n == 0
+    if fold_meta is not None:
+        cache_enabled = False
+        if bool(args.freeze_encoder) and bool(args.use_embedding_cache) and finetune_n == 0:
+            logger.info("CV fold: embedding cache disabled (per-fold train normalization).")
     cache_dir = Path(args.embedding_cache_dir) if args.embedding_cache_dir else (out_dir / "embedding_cache")
     cache_meta_by_split: Dict[str, Any] = {}
     if cache_enabled:
@@ -1526,7 +1434,7 @@ def run_training(
         )
         train_ds_cached, train_cache_meta = _build_or_load_cached_embeddings(
             split_name="train",
-            split_path=export_dir / "train.jsonl",
+            split_path=embedding_split_paths[0],
             raw_loader=train_loader_raw,
             pipeline=pipeline,
             context_length=args.context_length,
@@ -1542,7 +1450,7 @@ def run_training(
         )
         val_ds_cached, val_cache_meta = _build_or_load_cached_embeddings(
             split_name="val",
-            split_path=export_dir / "val.jsonl",
+            split_path=embedding_split_paths[1],
             raw_loader=val_loader_raw,
             pipeline=pipeline,
             context_length=args.context_length,
@@ -1562,7 +1470,7 @@ def run_training(
         if args.cache_test_embeddings:
             test_ds_cached, test_cache_meta = _build_or_load_cached_embeddings(
                 split_name="test",
-                split_path=export_dir / "test.jsonl",
+                split_path=embedding_split_paths[2],
                 raw_loader=test_loader_raw,
                 pipeline=pipeline,
                 context_length=args.context_length,
@@ -1641,6 +1549,7 @@ def run_training(
         "embedding_cache_enabled": bool(cache_enabled),
         "embedding_cache_dir": str(cache_dir.resolve()) if cache_enabled else None,
         "embedding_cache_metadata": cache_meta_by_split if cache_enabled else {},
+        "cv_fold_meta": fold_meta,
     }
     (out_dir / "train_meta.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
 
@@ -1953,6 +1862,288 @@ def run_training(
         "out_dir": str(out_dir.resolve()),
         "log_file": str(log_path.resolve()),
     }
+
+
+def run_training(
+    args: argparse.Namespace,
+    *,
+    optuna_trial: Any = None,
+    optuna_prune_min_epochs: int = 2,
+) -> Dict[str, Any]:
+    """Run one training job, or CV over pool.jsonl. If ``optuna_trial`` is set, reports val metrics."""
+    stage1_encoder = str(getattr(args, "stage1_encoder", "chronos"))
+    finetune_n = int(getattr(args, "encoder_finetune_last_n", 0))
+    if not args.freeze_encoder and finetune_n == 0:
+        raise NotImplementedError(
+            "Encoder fine-tuning: set --encoder-finetune-last-n N (N > 0) for last-N-block fine-tuning, "
+            "or use --freeze-encoder (default) for head-only training."
+        )
+    set_seed(args.seed)
+    export_dir = Path(args.export_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if args.log_file:
+        log_path = Path(args.log_file)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        log_path = out_dir / f"train_{stamp}.log"
+    logger = setup_logging(log_path)
+    logger.info("Logging to %s", log_path.resolve())
+    if args.config:
+        logger.info("Config file: %s", Path(args.config).resolve())
+    else:
+        logger.info("Config file: (none; using built-in TRAINING_DEFAULTS unless overridden on CLI)")
+    logger.info(
+        "Run settings: epochs=%d batch_size=%d lr=%s patience=%d early_stopping_metric=%s",
+        args.epochs,
+        args.batch_size,
+        args.lr,
+        args.patience,
+        args.early_stopping_metric,
+    )
+
+    vocab_path = export_dir / "vocab.json"
+    if not vocab_path.exists():
+        raise FileNotFoundError(f"Missing {vocab_path}. Run export_stage1_data.py first.")
+
+    num_classes = vocab_num_classes(vocab_path)
+    stage_cfg = load_stage1_cfg_from_export(export_dir, args)
+
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available; using cpu.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    if device.type == "cuda":
+        cuda_idx = device.index if device.index is not None else torch.cuda.current_device()
+        logger.info(
+            "Training on CUDA device index %s (%s); resolved from args.device=%r",
+            cuda_idx,
+            torch.cuda.get_device_name(device),
+            args.device,
+        )
+
+    moment_seq_len = 0
+    patch_info: Dict[str, Any] = {}
+    if stage1_encoder == "chronos":
+        _require_chronos()
+        from chronos import Chronos2Pipeline
+
+        logger.info("Loading Chronos: %s", args.chronos_model)
+        t0 = time.perf_counter()
+        pipeline = Chronos2Pipeline.from_pretrained(args.chronos_model)
+        pipeline.model.to(device)
+        if finetune_n > 0:
+            n_enc_layers = configure_chronos_encoder_finetune(pipeline.model, finetune_n)
+            logger.info(
+                "Encoder fine-tune: last %d transformer block(s) + final_layer_norm trainable (encoder depth=%d).",
+                finetune_n,
+                n_enc_layers,
+            )
+            if args.freeze_encoder:
+                logger.warning(
+                    "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
+                    finetune_n,
+                )
+        else:
+            for p in pipeline.model.parameters():
+                p.requires_grad = False
+        pipeline.model.eval()
+        logger.info("Chronos loaded on %s in %.1fs", device, time.perf_counter() - t0)
+
+        patch_info = read_chronos_patch_info(pipeline)
+        if patch_info:
+            logger.info("Chronos patch config: %s", patch_info)
+            ips = patch_info.get("input_patch_size")
+            if ips and args.target_rate_hz > 0:
+                ms = 1000.0 * ips / args.target_rate_hz
+                est = math.ceil(args.context_length / ips) if args.context_length else None
+                logger.info(
+                    "At %.1f Hz, input_patch_size=%d steps ≈ %.1f ms per patch; "
+                    "context_length=%d → ~%s input patches along time (per series before specials).",
+                    args.target_rate_hz,
+                    ips,
+                    ms,
+                    args.context_length,
+                    est,
+                )
+        else:
+            logger.info("Could not read chronos_config from model (patch info unavailable).")
+
+        if getattr(args, "chronos_input_patch_size", None) is None:
+            args.chronos_input_patch_size = int((patch_info or {}).get("input_patch_size", 16) or 16)
+        else:
+            args.chronos_input_patch_size = int(args.chronos_input_patch_size)
+
+    elif stage1_encoder == "moment":
+        _require_moment()
+        logger.info("Loading MOMENT: %s", args.moment_model)
+        t0 = time.perf_counter()
+        pipeline = load_moment_pipeline(args.moment_model, device)
+        if finetune_n > 0:
+            n_enc_layers = configure_moment_encoder_finetune(pipeline, finetune_n)
+            logger.info(
+                "Encoder fine-tune: last %d T5 block(s) + final_layer_norm trainable (encoder depth=%d).",
+                finetune_n,
+                n_enc_layers,
+            )
+            if args.freeze_encoder:
+                logger.warning(
+                    "encoder_finetune_last_n=%d: training last encoder blocks; ignoring freeze_encoder=True in logs/meta.",
+                    finetune_n,
+                )
+        else:
+            for p in pipeline.parameters():
+                p.requires_grad = False
+        pipeline.eval()
+        logger.info("MOMENT loaded on %s in %.1fs", device, time.perf_counter() - t0)
+
+        patch_info = read_moment_patch_info(pipeline)
+        if patch_info:
+            logger.info("MOMENT patch config: %s", patch_info)
+        moment_seq_len = int(getattr(pipeline.config, "seq_len", 512) or 512)
+        if getattr(args, "chronos_input_patch_size", None) is None:
+            args.chronos_input_patch_size = int((patch_info or {}).get("patch_len", 8) or 8)
+        else:
+            args.chronos_input_patch_size = int(args.chronos_input_patch_size)
+        logger.info(
+            "MOMENT seq_len=%d: each window is linearly resampled to this many time steps before patching "
+            "(this is sequence length, not sample rate in Hz).",
+            moment_seq_len,
+        )
+        if int(getattr(args, "encoder_output_drop_last_specials", 0)) != 0:
+            logger.info(
+                "MOMENT has no Chronos trailing special tokens; setting encoder_output_drop_last_specials "
+                "from %d to 0.",
+                int(args.encoder_output_drop_last_specials),
+            )
+            args.encoder_output_drop_last_specials = 0
+    else:
+        raise ValueError(f"Unknown --stage1-encoder {stage1_encoder!r} (expected chronos or moment).")
+
+    cv_mode = str(getattr(args, "cv_mode", "none") or "none")
+    pool_path = export_dir / "pool.jsonl"
+
+    if cv_mode != "none":
+        if not pool_path.is_file():
+            raise FileNotFoundError(
+                f"--cv-mode {cv_mode} requires {pool_path}. "
+                "Re-export with: export_stage1_data.py --session-split-strategy session_pool"
+            )
+        pool_rows = load_stage1_jsonl_rows(pool_path)
+        val_ratio_cv = float(getattr(args, "cv_val_ratio", 0.2))
+        folds = build_stage1_cv_folds(
+            pool_rows,
+            cv_mode,  # type: ignore[arg-type]
+            val_ratio=val_ratio_cv,
+            split_seed=int(getattr(args, "cv_split_seed", 42)),
+        )
+        fi = getattr(args, "cv_fold_index", None)
+        if fi is not None:
+            folds = [folds[int(fi)]]
+        logger.info("CV mode=%s: running %d fold(s).", cv_mode, len(folds))
+        results: List[Dict[str, Any]] = []
+        for fold in folds:
+            idx = int(fold["fold_index"])
+            fold_out = out_dir / f"fold_{idx:03d}"
+            fold_out.mkdir(parents=True, exist_ok=True)
+            fold_log = fold_out / f"train_fold_{idx:03d}.log"
+            flog = setup_logging(fold_log)
+            tr = [pool_rows[i] for i in fold["train_indices"]]
+            va = [pool_rows[i] for i in fold["val_indices"]]
+            te = [pool_rows[i] for i in fold["test_indices"]]
+            train_ds = Stage1IMUKeyDataset(pool_path, stage_cfg, rows=tr)
+            val_ds = Stage1IMUKeyDataset(pool_path, stage_cfg, rows=va)
+            test_ds = Stage1IMUKeyDataset(pool_path, stage_cfg, rows=te)
+            flog.info(
+                "Fold %d: train=%d val=%d test=%d (held_out subject=%s session=%s personalized=%s)",
+                idx,
+                len(tr),
+                len(va),
+                len(te),
+                fold.get("test_subject"),
+                fold.get("test_session"),
+                fold.get("personalized_subject"),
+            )
+            emb_paths = (pool_path, pool_path, pool_path)
+            r = _train_one_split(
+                args,
+                flog,
+                fold_log,
+                device=device,
+                pipeline=pipeline,
+                stage1_encoder=stage1_encoder,
+                finetune_n=finetune_n,
+                moment_seq_len=moment_seq_len,
+                patch_info=patch_info,
+                stage_cfg=stage_cfg,
+                export_dir=export_dir,
+                embedding_split_paths=emb_paths,
+                vocab_path=vocab_path,
+                num_classes=num_classes,
+                train_ds=train_ds,
+                val_ds=val_ds,
+                test_ds=test_ds,
+                out_dir=fold_out,
+                fold_meta=fold,
+                optuna_trial=None,
+                optuna_prune_min_epochs=optuna_prune_min_epochs,
+            )
+            r["fold_meta"] = fold
+            results.append(r)
+        summary: Dict[str, Any] = {
+            "cv_mode": cv_mode,
+            "export_dir": str(export_dir.resolve()),
+            "cv_split_seed": int(getattr(args, "cv_split_seed", 42)),
+            "cv_val_ratio": float(getattr(args, "cv_val_ratio", 0.2)),
+            "folds": results,
+        }
+        sum_path = out_dir / "cv_summary.json"
+        sum_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+        logger.info("Wrote CV summary to %s", sum_path.resolve())
+        return summary
+
+    train_jsonl = export_dir / "train.jsonl"
+    if not train_jsonl.is_file():
+        if pool_path.is_file():
+            raise FileNotFoundError(
+                f"Missing {train_jsonl}; export has pool.jsonl only. "
+                "Use --cv-mode lopo / loso_all / loso_personalized for cross-validation."
+            )
+        raise FileNotFoundError(f"Missing {train_jsonl}. Run export_stage1_data.py first.")
+
+    train_ds = Stage1IMUKeyDataset(train_jsonl, stage_cfg)
+    val_ds = Stage1IMUKeyDataset(export_dir / "val.jsonl", stage_cfg)
+    test_ds = Stage1IMUKeyDataset(export_dir / "test.jsonl", stage_cfg)
+    emb_paths = (
+        export_dir / "train.jsonl",
+        export_dir / "val.jsonl",
+        export_dir / "test.jsonl",
+    )
+    return _train_one_split(
+        args,
+        logger,
+        log_path,
+        device=device,
+        pipeline=pipeline,
+        stage1_encoder=stage1_encoder,
+        finetune_n=finetune_n,
+        moment_seq_len=moment_seq_len,
+        patch_info=patch_info,
+        stage_cfg=stage_cfg,
+        export_dir=export_dir,
+        embedding_split_paths=emb_paths,
+        vocab_path=vocab_path,
+        num_classes=num_classes,
+        train_ds=train_ds,
+        val_ds=val_ds,
+        test_ds=test_ds,
+        out_dir=out_dir,
+        fold_meta=None,
+        optuna_trial=optuna_trial,
+        optuna_prune_min_epochs=optuna_prune_min_epochs,
+    )
 
 
 def main() -> None:

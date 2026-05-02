@@ -12,6 +12,8 @@ SessionSplitStrategy = Literal[
     "session_random",
     "session_holdout",
     "session_holdout_random_train_val",
+    # Single global pool (all rows); train/val/test splits come from train_stage1_chronos --cv-mode.
+    "session_pool",
 ]
 
 
